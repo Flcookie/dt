@@ -7,7 +7,7 @@ from typing import Any
 
 import part_track.flow_classification as flow_classification
 import part_track.part_station_matrix as part_station_matrix
-import twin.twin_layout as twin_layout
+import part_track.process_stages as process_stages
 
 
 def _step_epoch_seconds(step: dict) -> float | None:
@@ -45,7 +45,7 @@ def segment_has_mainline_fail(seg: list[dict]) -> bool:
         if str(s.get("activity") or "").strip().upper() != "FAIL":
             continue
         cid = str(s.get("component_id") or "").strip()
-        if twin_layout.component_to_process_stage(cid) is not None:
+        if process_stages.component_to_process_stage(cid) is not None:
             return True
     return False
 
@@ -284,7 +284,7 @@ def current_station_display(steps: list[dict]) -> str:
     )
     for s in reversed(steps):
         cid = str(s.get("component_id") or "").strip()
-        if not twin_layout.component_to_process_stage(cid):
+        if not process_stages.component_to_process_stage(cid):
             continue
         act = str(s.get("activity") or "").strip().upper()
         if act in _anchor_acts:

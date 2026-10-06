@@ -1,7 +1,7 @@
 """Part 路径结局分类：Normal / Rework / Scrap / 进行中（与 week6 纪要一致，规则版）。
 
 **物理回路 ≠ 工艺返工**；**一轮 FINISH 后的新一圈** 不与上一圈拼接判返工（FINISH 分段）；**rollback**
-只看 ``twin_layout.stage_entry_sequence_clean``（**PROCESS/PASS** -only、去重），不把 LOAD/TRANSFER
+只看 ``process_stages.stage_entry_sequence_clean``（**PROCESS/PASS** -only、去重），不把 LOAD/TRANSFER
 等记入阶段序列。**仅当每一步都有有效** ``timestamp`` 时才按时间排序；**FAIL** 后仍有 **PROCESS/PASS** 或 **≥2 次 FAIL**
 而未 **FINISH** → **Rework**；仅单次 FAIL 且末事件后无恢复 → **FAIL_OPEN**。
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import twin.twin_layout as twin_layout
+import part_track.process_stages as process_stages
 
 OUTCOME_SCRAP = "scrap"
 OUTCOME_REWORK = "rework"
@@ -95,7 +95,7 @@ def _has_process_pass_after_last_fail(steps: list[dict]) -> bool:
     return False
 
 
-# Keys must match ``twin_layout.PROCESS_STAGE_ORDER`` labels.
+# Keys must match ``process_stages.PROCESS_STAGE_ORDER`` labels.
 _MAINLINE_STAGE_RANK: dict[str, int] = {
     "ST11": 0,
     "ST21/22": 1,
@@ -154,13 +154,13 @@ def stage_rework_evidence(steps: list[dict]) -> tuple[bool, str]:
     last_act = str(steps[-1].get("activity") or "").strip().upper()
     if last_act == "FINISH":
         for seg in _finish_delimited_segments(steps):
-            st = twin_layout.stage_entry_sequence_clean(seg)
+            st = process_stages.stage_entry_sequence_clean(seg)
             hit, msg = has_stage_rework_loop(st)
             if hit:
                 return True, msg
         return False, ""
     tail = _open_tail_after_last_finish(steps)
-    st = twin_layout.stage_entry_sequence_clean(tail)
+    st = process_stages.stage_entry_sequence_clean(tail)
     return has_stage_rework_loop(st)
 
 
@@ -237,7 +237,7 @@ def classify_flow_from_steps(steps: list[dict]) -> dict[str, Any]:
     steps = _sort_steps_chronological(steps)
     stations = station_sequence_from_steps(steps)
     path_str = " → ".join(stations) if stations else "—"
-    stage_entries_full = twin_layout.stage_entry_sequence_clean(steps)
+    stage_entries_full = process_stages.stage_entry_sequence_clean(steps)
     stage_path_str = " → ".join(stage_entries_full) if stage_entries_full else "—"
     base = _classify_base_fields(stations, path_str, stage_path_str)
     acts_upper = [str(s.get("activity") or "").strip().upper() for s in steps]

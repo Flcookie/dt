@@ -17,6 +17,7 @@ tests = [
     # pipeline tests here and the plant-log regression in test_kpi_calculator.py.
     ("event pipeline / buffer", ["test_event_pipeline.py"]),
     ("KPI calculator", ["test_kpi_calculator.py"]),
+    ("process stages", ["test_process_stages.py"]),
     ("replay scripts", ["test_replay_direct.py"]),
     (
         "streamlit_app",

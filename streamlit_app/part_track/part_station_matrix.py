@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-import twin.twin_layout as twin_layout
+import part_track.process_stages as process_stages
 
 
 def mainline_track_columns() -> list[str]:
     """工艺对齐工序列（Expected path：ST11→…→ST71，并行段合并）。"""
-    return list(twin_layout.PROCESS_STAGE_ORDER)
+    return list(process_stages.PROCESS_STAGE_ORDER)
 
 
 def progress_anchor_component_id(steps: list[dict], columns: list[str]) -> str | None:
@@ -17,7 +17,7 @@ def progress_anchor_component_id(steps: list[dict], columns: list[str]) -> str |
         return None
     colset = frozenset(columns)
     for s in reversed(steps):
-        st = twin_layout.component_to_process_stage(str(s.get("component_id") or ""))
+        st = process_stages.component_to_process_stage(str(s.get("component_id") or ""))
         if st and st in colset:
             return st
     return None
@@ -47,19 +47,19 @@ def cells_for_steps(steps: list[dict], columns: list[str]) -> dict[str, str]:
 
 def cells_progress_matrix(steps: list[dict], columns: list[str]) -> dict[str, str]:
     """✓ 已过该工序格 · ○ 当前锚点工序 · ↺ 工序格重复进入 · ✕ Scrap/FAIL 失效锚点（仅当末事件为 SCRAP 或 FAIL）。"""
-    episodes = twin_layout.stage_entry_sequence_clean(steps)
+    episodes = process_stages.stage_entry_sequence_clean(steps)
     out: dict[str, str] = {}
     last_act = str(steps[-1].get("activity") or "").strip().upper() if steps else ""
     colset = frozenset(columns)
     o_col = progress_anchor_component_id(steps, columns)
     scrap_col: str | None = None
     if last_act == "SCRAP":
-        cr = twin_layout.component_to_process_stage(
+        cr = process_stages.component_to_process_stage(
             str(steps[-1].get("component_id") or "")
         )
         scrap_col = cr if cr and cr in colset else o_col
     elif last_act == "FAIL":
-        cr = twin_layout.component_to_process_stage(
+        cr = process_stages.component_to_process_stage(
             str(steps[-1].get("component_id") or "")
         )
         scrap_col = cr if cr and cr in colset else o_col

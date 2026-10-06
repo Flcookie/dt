@@ -15,7 +15,7 @@ import services.neo4j_backend as neo4j_backend
 import part_track.part_station_matrix as part_station_matrix
 import part_track.part_track_conformance as part_track_conformance
 import part_track.part_track_model as part_track_model
-import twin.twin_layout as twin_layout
+import part_track.process_stages as process_stages
 
 
 def _twin_session_summary_column_names() -> list[str]:
@@ -651,7 +651,7 @@ def _render_part_detail_block(
                 parts_payload=[(part_id, steps, short_label)],
             )
     seg_rows = part_track_model.cycle_rows_for_detail(
-        life, preferred_stations=twin_layout.LOGGED_COMPONENT_IDS
+        life, preferred_stations=process_stages.LOGGED_COMPONENT_IDS
     )
     with st.expander(
         "Production cycles (FINISH-delimited)",
@@ -828,7 +828,7 @@ def _render_session_overview(parts: list[dict], event_level: str) -> None:
         "Each row = **current lap** (FINISH-delimited). "
         "**Status** summarizes quality for this lap; expand **Part detail** for per-lap breakdown and events."
     )
-    pref = twin_layout.LOGGED_COMPONENT_IDS
+    pref = process_stages.LOGGED_COMPONENT_IDS
     overview_rows: list[dict] = []
     path_rows: list[dict] = []
     matrix_payload: list[tuple[str, list[dict], str]] = []
@@ -900,7 +900,7 @@ def _render_single_part(p: dict, event_level: str, page_size: int) -> None:
                 pid,
                 steps,
                 info,
-                preferred_stations=twin_layout.LOGGED_COMPONENT_IDS,
+                preferred_stations=process_stages.LOGGED_COMPONENT_IDS,
                 lifecycle_steps=raw_steps,
             )
         ],
