@@ -233,6 +233,45 @@ def _fetch_events(
     )
 
 
+def _rebuild_bundle(session_id: str, mode: str, replay_cap: float | None) -> dict[str, Any]:
+    """Fresh sim from all session events (up to the replay cap) and the cursor after them."""
+    sim = empty_sim_state()
+    until = replay_cap if mode == "replay" and replay_cap is not None else None
+    events = _fetch_events(session_id, cursor_ts=None, cursor_id="", until_ts=until)
+    replay_events(sim, events)
+    cursor_ts, cursor_id = cursor_after_events(events)
+    return {
+        "session_id": session_id,
+        "mode": mode,
+        "replay_cap": replay_cap,
+        "cursor_ts": cursor_ts,
+        "cursor_id": cursor_id,
+        "consumed_events": len(events),
+        "sim": sim,
+    }
+
+
+def _missed_or_removed_events(bundle: dict[str, Any], session_id: str) -> bool:
+    """True when the events at or before the cursor are no longer the ones consumed.
+
+    Happens when an event is written after the cursor moved past its position — a late event
+    with an earlier timestamp, or one with the cursor's timestamp but a smaller (random) id —
+    when events were removed, or when the cursor event itself is gone (session cleared and
+    written again under the same id). Incremental reads cannot repair that; the caller
+    rebuilds. A failed check keeps the current state.
+    """
+    cursor_ts = bundle.get("cursor_ts")
+    if cursor_ts is None:
+        return False
+    status = neo4j_backend.floor_cursor_status(
+        session_id, cursor_ts, str(bundle.get("cursor_id") or "")
+    )
+    if status is None:
+        return False
+    n, cursor_present = status
+    return not cursor_present or n != bundle.get("consumed_events")
+
+
 def sync_factory_floor_sim(
     session_id: str | None,
     *,
@@ -261,21 +300,9 @@ def sync_factory_floor_sim(
 
     if reset:
         st.session_state.pop(_SESSION_KEY, None)
-        sim = empty_sim_state()
-        until = replay_cap if mode == "replay" and replay_cap is not None else None
-        events = _fetch_events(sid, cursor_ts=None, cursor_id="", until_ts=until)
-        replay_events(sim, events)
-        cursor_ts, cursor_id = cursor_after_events(events)
-        bundle = {
-            "session_id": sid,
-            "mode": mode,
-            "replay_cap": replay_cap,
-            "cursor_ts": cursor_ts,
-            "cursor_id": cursor_id,
-            "sim": sim,
-        }
+        bundle = _rebuild_bundle(sid, mode, replay_cap)
         st.session_state[_SESSION_KEY] = bundle
-        return sim, None
+        return bundle["sim"], None
 
     sim = bundle.get("sim")
     if not isinstance(sim, dict):
@@ -291,6 +318,10 @@ def sync_factory_floor_sim(
             return sim, None
         old_cap = float(bundle.get("replay_cap") or -1.0)
         if replay_cap > old_cap + 1e-4:
+            if _missed_or_removed_events(bundle, sid):
+                bundle = _rebuild_bundle(sid, mode, replay_cap)
+                st.session_state[_SESSION_KEY] = bundle
+                return bundle["sim"], None
             events = _fetch_events(
                 sid,
                 cursor_ts=cursor_ts if cursor_ts is not None else None,
@@ -299,6 +330,7 @@ def sync_factory_floor_sim(
             )
             if events:
                 replay_events(sim, events)
+                bundle["consumed_events"] = int(bundle.get("consumed_events") or 0) + len(events)
                 nts, nid = cursor_after_events(events)
                 if nts is not None:
                     bundle["cursor_ts"] = nts
@@ -306,6 +338,10 @@ def sync_factory_floor_sim(
             bundle["replay_cap"] = replay_cap
             bundle["sim"] = sim
     else:
+        if _missed_or_removed_events(bundle, sid):
+            bundle = _rebuild_bundle(sid, mode, replay_cap)
+            st.session_state[_SESSION_KEY] = bundle
+            return bundle["sim"], None
         events = _fetch_events(
             sid,
             cursor_ts=cursor_ts if cursor_ts is not None else None,
@@ -314,6 +350,7 @@ def sync_factory_floor_sim(
         )
         if events:
             replay_events(sim, events)
+            bundle["consumed_events"] = int(bundle.get("consumed_events") or 0) + len(events)
             nts, nid = cursor_after_events(events)
             if nts is not None:
                 bundle["cursor_ts"] = nts

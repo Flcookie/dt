@@ -3,6 +3,8 @@
 # Each group runs under pytest so every test function is executed (running a test file as a
 # plain script only executes its optional __main__ block). pytest must be installed; the
 # streamlit_app UI tests also need streamlit (requirements.txt) and are skipped without it.
+# The Neo4j integration group runs only when NEO4J_TEST_URI points at a disposable test
+# database (see test_floor_events_neo4j.py); otherwise it is reported as skipped (-rs).
 
 import os
 import subprocess
@@ -23,14 +25,16 @@ tests = [
             "test_history_panel_ui.py",
             "test_part_trace_panel_ui.py",
             "test_home_ui.py",
+            "test_factory_floor_sim.py",
         ],
     ),
+    ("Neo4j integration (opt-in: NEO4J_TEST_URI)", ["test_floor_events_neo4j.py"]),
 ]
 
 failed = []
 for name, files in tests:
     print(f"\n--- {name} ---")
-    r = subprocess.run([sys.executable, "-m", "pytest", "-q", *files], cwd=ROOT)
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rs", *files], cwd=ROOT)
     if r.returncode != 0:
         failed.append(name)
 

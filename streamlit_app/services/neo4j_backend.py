@@ -488,8 +488,10 @@ def fetch_session_events_for_floor(
 ) -> list[dict]:
     """Ordered session events for factory floor ``process_event_state``.
 
-    Cursor ``(since_ts, since_event_id)`` is exclusive when both set.
-    ``until_ts`` is inclusive when set.
+    Events are ordered by ``(timestamp, event id)``; the id only breaks ties between equal
+    timestamps (ids are random, not arrival order). Cursor ``(since_ts, since_event_id)`` is
+    exclusive: only events strictly after it in that order are returned. ``until_ts`` is
+    inclusive when set. Events without a numeric timestamp are skipped.
     """
     sid = (session_id or "").strip()
     if not sid:
@@ -509,9 +511,6 @@ def fetch_session_events_for_floor(
             r = s.run(
                 """
                 MATCH (e:Event)-[:IN_SESSION]->(sess:Session {id: $sid})
-                OPTIONAL MATCH (e)-[:OCCURRED_AT]->(st:Station)
-                OPTIONAL MATCH (e)-[:OF_ACTIVITY]->(a:Activity)
-                OPTIONAL MATCH (e)-[:ACTS_ON]->(en:Entity)
                 WHERE ($until_ts IS NULL OR e.timestamp <= $until_ts)
                   AND (
                     $since_ts IS NULL
@@ -521,6 +520,9 @@ def fetch_session_events_for_floor(
                       AND coalesce(e.id, '') > coalesce($since_id, '')
                     )
                   )
+                OPTIONAL MATCH (e)-[:OCCURRED_AT]->(st:Station)
+                OPTIONAL MATCH (e)-[:OF_ACTIVITY]->(a:Activity)
+                OPTIONAL MATCH (e)-[:ACTS_ON]->(en:Entity)
                 RETURN coalesce(
                     e.time,
                     toString(datetime({epochSeconds: toInteger(toFloat(e.timestamp))}))
@@ -530,7 +532,7 @@ def fetch_session_events_for_floor(
                   coalesce(e.activity, a.name, '') AS activity,
                   e.timestamp AS ts,
                   e.id AS event_id
-                ORDER BY e.timestamp ASC, e.id ASC
+                ORDER BY e.timestamp ASC, coalesce(e.id, '') ASC
                 """,
                 sid=sid,
                 since_ts=since,
@@ -559,6 +561,47 @@ def fetch_session_events_for_floor(
             return out
     except Exception:
         return []
+
+
+def floor_cursor_status(
+    session_id: str, cursor_ts: float, cursor_event_id: str | None
+) -> tuple[int, bool] | None:
+    """``(events at or before the cursor, cursor event still in the session)``; None on error.
+
+    Same ``(timestamp, event id)`` order and timestamp rule as ``fetch_session_events_for_floor``.
+    The floor sim compares the count with the number of events it has consumed to detect events
+    written after it moved past them (late or same-timestamp arrivals) or removed, and treats a
+    missing cursor event as "this session was cleared and written again". An empty
+    ``cursor_event_id`` is reported as present.
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return 0, False
+    cursor_id = cursor_event_id or ""
+    try:
+        d = get_driver()
+        with d.session() as s:
+            rec = s.run(
+                """
+                MATCH (e:Event)-[:IN_SESSION]->(:Session {id: $sid})
+                WHERE e.timestamp IS NOT NULL
+                  AND (
+                    e.timestamp < $cursor_ts
+                    OR (e.timestamp = $cursor_ts AND coalesce(e.id, '') <= $cursor_id)
+                  )
+                RETURN count(e) AS c,
+                       $cursor_id = '' OR count(CASE WHEN e.id = $cursor_id THEN 1 END) > 0 AS present
+                """,
+                sid=sid,
+                cursor_ts=float(cursor_ts),
+                cursor_id=cursor_id,
+            ).single()
+            if not rec:
+                return 0, cursor_id == ""
+            return int(rec["c"] or 0), bool(rec["present"])
+    except Exception as ex:
+        _log.warning("floor_cursor_status(%s) failed: %s", sid, ex)
+        return None
 
 
 def import_csv_session(
