@@ -1,0 +1,8 @@
+paho-mqtt<2.0.0
+pandas
+paramiko
+neo4j
+psutil
+python-dotenv
+streamlit>=1.33.0
+plotly>=5.18.0

@@ -1,0 +1,75 @@
+# --- Secrets & local config (never commit) ---
+.env
+config.json
+config_local.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- IDE / agent ---
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+
+# --- Runtime & logs ---
+*.log
+*.pid
+main_service.pid
+.replay_kpi.json
+.last_control_action.json
+.control_action_history.jsonl
+start_programs_progress.json
+
+# Runtime log output (local only)
+event-logs/
+
+# --- OS ---
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# --- Large / duplicate docs (optional local) ---
+README.pdf
+
+# --- Optional hardware tutorials (not part of twin dashboard) ---
+adafruit_pn532/
+buildhat/
+ev3dev/
+pia-tutorial/
+
+# --- Markdown: README + project reports ---
+*.md
+!README.md
+!report3.md
+
+# --- Arena what-if: keep model inputs; ignore run artifacts ---
+model/runs/
+model/_siman_test/
+model/*.db
+model/*.out
+model/*.opw
+model/*.bak
+model/*_rpt.xlsm
+model/Output.txt
+
+# --- Local-only: docs, legacy code, lab lines, README screenshots ---
+doc/
+docs/
+code/
+g1-5s-pl/
+g2-2s-pl/
+images/
+mt-ems-pl/
+scripts/

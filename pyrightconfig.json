@@ -1,0 +1,7 @@
+{
+  "include": ["."],
+  "exclude": [".venv", "**/__pycache__"],
+  "extraPaths": ["streamlit_app"],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic"
+}

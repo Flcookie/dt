@@ -1,0 +1,264 @@
+﻿{
+    "component_wips": {
+        "station11": 16, "splitters12": 0, "station31": 0, "splitters34": 0,
+        "station61": 0,  "splitter5": 0
+    },
+    "log_folder": "event-logs",
+    "log_columns": ["time", "component_id", "part_id", "activity"],
+    "neo4j": {
+        "uri": "bolt://localhost:7687",
+        "username": "neo4j",
+        "password": "CHANGE_ME"
+    },
+    "event_buffer": {
+        "window_ms": 500,
+        "max_size": 500,
+        "replay_window_ms": 50,
+        "kpi_print_interval_sec": 3.0
+    },
+    "kpi_config": {
+        "observation_time_mode": "realtime",
+        "finish_events": ["FINISH"],
+        "scrap_events": ["SCRAP"]
+    },
+    "process_mining": {
+        "df_process_activities": [
+            "START",
+            "LOAD",
+            "PROCESS",
+            "UNLOAD",
+            "FINISH",
+            "SCRAP"
+        ],
+        "enable_df_process_on_write": true,
+        "enable_station_df_on_write": true,
+        "enable_entity_df_on_write": true
+    },
+    "controller_hostnames": [
+        "corner1", "corner2", "driver1", "driver2", "driver3", "driver4",
+        "splitter5", "splitters12", "splitters34",
+        "station11", "station21", "station22", "station31", "station41",
+        "station51", "station52", "station61", "station71"
+    ],
+    "controller_ssh_username": "robot",
+    "controller_ssh_password": "CHANGE_ME",
+    "server_hostname": "server0",
+    "server_ssh_username": "robot",
+    "server_ssh_password": "CHANGE_ME",
+    "server_mqtt_port": 1883,
+    "system_start_delay": 5.0,
+    "mqtt_broker_host": "server0",
+    "mqtt_broker_port": 1883,
+    "mqtt_publication_interval": 3.0,
+    "ssh_username": "robot",
+    "ssh_password": "CHANGE_ME",
+    "mqtt_broker_ssh_username": "robot",
+    "mqtt_broker_ssh_password": "CHANGE_ME",
+
+    "remote_folder_path": "Python",
+    "program_script_paths": {
+        "corner1": "corner.py",
+        "corner2": "corner.py",
+        "driver1": "driver.py",
+        "driver2": "driver.py",
+        "driver3": "driver.py",
+        "driver4": "driver.py",
+        "splitter5": "splitter.py",
+        "splitters12": "splitter_pair.py",
+        "splitters34": "splitter_pair.py",
+        "station11": "block_station.py",
+        "station21": "nonblock_station.py",
+        "station22": "nonblock_station.py",
+        "station31": "block_station.py",
+        "station41": "nonblock_station.py",
+        "station51": "nonblock_station.py",
+        "station52": "nonblock_station.py",
+        "station61": "block_station.py",
+        "station71": "nonblock_station.py"
+    },
+    "program_start_time": 20.0,
+    "program_stop_time": 5.0,
+
+    "local_folder_path": "mt-ems-pl",
+    "local_code_paths": {
+        "corner1": [
+            "corner.py",
+            "common.py",
+            "corner1/specific.py",
+            "schema.json"
+        ],
+        "corner2": [
+            "corner.py",
+            "common.py",
+            "corner2/specific.py",
+            "schema.json"
+        ],
+        "driver1": [
+            "driver.py",
+            "common.py",
+            "schema.json"
+        ],
+        "driver2": [
+            "driver.py",
+            "common.py",
+            "schema.json"
+        ],
+        "driver3": [
+            "driver.py",
+            "common.py",
+            "schema.json"
+        ],
+        "driver4": [
+            "driver.py",
+            "common.py",
+            "schema.json"
+        ],
+        "splitter5": [
+            "splitter.py",
+            "common.py",
+            "splitter5/specific.py",
+            "schema.json"
+        ],
+        "splitters12": [
+            "splitter_pair.py",
+            "common.py",
+            "splitters12/specific.py",
+            "schema.json"
+        ],
+        "splitters34": [
+            "splitter_pair.py",
+            "common.py",
+            "splitters34/specific.py",
+            "schema.json"
+        ],
+        "station11": [
+            "block_station.py",
+            "common.py",
+            "station11/specific.py",
+            "schema.json"
+        ],
+        "station21": [
+            "nonblock_station.py",
+            "common.py",
+            "station21/specific.py",
+            "schema.json"
+        ],
+        "station22": [
+            "nonblock_station.py",
+            "common.py",
+            "station22/specific.py",
+            "schema.json"
+        ],
+        "station31": [
+            "block_station.py",
+            "common.py",
+            "station31/specific.py",
+            "schema.json"
+        ],
+        "station41": [
+            "nonblock_station.py",
+            "common.py",
+            "station41/specific.py",
+            "schema.json"
+        ],
+        "station51": [
+            "nonblock_station.py",
+            "common.py",
+            "station51/specific.py",
+            "schema.json"
+        ],
+        "station52": [
+            "nonblock_station.py",
+            "common.py",
+            "station52/specific.py",
+            "schema.json"
+        ],
+        "station61": [
+            "block_station.py",
+            "common.py",
+            "station61/specific.py",
+            "schema.json"
+        ],
+        "station71": [
+            "nonblock_station.py",
+            "common.py",
+            "station71/specific.py",
+            "schema.json"
+        ]
+    },
+    "local_config_paths": {
+        "corner1": [
+            "common.json",
+            "corner1/specific.json"
+        ],
+        "corner2": [
+            "common.json",
+            "corner2/specific.json"
+        ],
+        "driver1": [
+            "common.json",
+            "driver1/specific.json"
+        ],
+        "driver2": [
+            "common.json",
+            "driver2/specific.json"
+        ],
+        "driver3": [
+            "common.json",
+            "driver3/specific.json"
+        ],
+        "driver4": [
+            "common.json",
+            "driver4/specific.json"
+        ],
+        "splitter5": [
+            "common.json",
+            "splitter5/specific.json"
+        ],
+        "splitters12": [
+            "common.json",
+            "splitters12/specific.json"
+        ],
+        "splitters34": [
+            "common.json",
+            "splitters34/specific.json"
+        ],
+        "station11": [
+            "common.json",
+            "station11/specific.json"
+        ],
+        "station21": [
+            "common.json",
+            "station21/specific.json"
+        ],
+        "station22": [
+            "common.json",
+            "station22/specific.json"
+        ],
+        "station31": [
+            "common.json",
+            "station31/specific.json"
+        ],
+        "station41": [
+            "common.json",
+            "station41/specific.json"
+        ],
+        "station51": [
+            "common.json",
+            "station51/specific.json"
+        ],
+        "station52": [
+            "common.json",
+            "station52/specific.json"
+        ],
+        "station61": [
+            "common.json",
+            "station61/specific.json"
+        ],
+        "station71": [
+            "common.json",
+            "station71/specific.json"
+        ]
+    }
+}
+

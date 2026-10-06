@@ -1,0 +1,16 @@
+# LEGO Factory — 本地体验优化（切换页面 / 重跑）
+# 文档: https://docs.streamlit.io/develop/api-reference/config
+
+[runner]
+# 减少交互后等待“脚本完全结束”的感知延迟
+fastReruns = true
+
+[client]
+toolbarMode = "minimal"
+# 关闭 Streamlit 默认「多页列表」（避免出现 app / 与顶栏重复）；自定义 `st.sidebar` 仍可用。
+showSidebarNavigation = false
+
+[browser]
+gatherUsageStats = false
+# Open the app at http://127.0.0.1:8501/ (root). Bookmarking .../Realtime can cause
+# harmless 404s on /Realtime/_stcore/* before the correct /_stcore requests succeed.
