@@ -13,9 +13,9 @@ import sys
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 tests = [
-    # No dedicated event_buffer test file exists; EventBuffer is exercised through the
-    # pipeline tests here and the plant-log regression in test_kpi_calculator.py.
-    ("event pipeline / buffer", ["test_event_pipeline.py"]),
+    # EventBuffer also runs inside the pipeline tests and the plant-log regression in
+    # test_kpi_calculator.py.
+    ("event pipeline / buffer", ["test_event_pipeline.py", "test_event_buffer.py"]),
     ("main_service", ["test_main_service.py"]),
     ("KPI calculator", ["test_kpi_calculator.py"]),
     ("process stages", ["test_process_stages.py"]),

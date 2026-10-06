@@ -1,10 +1,16 @@
 # event_buffer.py - buffer for out-of-order MQTT events
 # Event-driven: uses latest event timestamp for cutoff, not wall clock.
 # Time window + bisect insert, output events older than window_ms.
+# Events with the same timestamp keep the order in which they entered the buffer.
 
 import bisect
 import datetime
 import threading
+
+
+def _timestamp(item: tuple) -> float:
+    """Sort key of a buffered (ts, event) item: the timestamp only, never the event dict."""
+    return item[0]
 
 
 def parse_time_to_float(time_str: str) -> float:
@@ -19,7 +25,9 @@ def parse_time_to_float(time_str: str) -> float:
 class EventBuffer:
     """
     Buffer for MQTT events that may arrive out of order.
-    Events are sorted by timestamp. Event-driven flush uses the latest
+    Events are sorted by timestamp; events with the same timestamp stay in the order they
+    were added (insort with a timestamp key puts a new item after equal keys, and the event
+    dicts are never compared). Event-driven flush uses the latest
     received event's timestamp to determine which older events are safe to process.
     """
 
@@ -43,7 +51,7 @@ class EventBuffer:
         ts = parse_time_to_float(time_str)
         item = (ts, event)
         with self._lock:
-            bisect.insort(self._events, item)
+            bisect.insort(self._events, item, key=_timestamp)
 
     def add_and_flush(self, event: dict) -> tuple[list[dict], int]:
         """
@@ -60,7 +68,7 @@ class EventBuffer:
         item = (ts, event)
 
         with self._lock:
-            bisect.insort(self._events, item)
+            bisect.insort(self._events, item, key=_timestamp)
 
             # Watermark must be max timestamp in buffer (late/out-of-order inserts are sorted
             # in — last element equals max today, but this stays correct if ordering changes).

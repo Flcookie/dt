@@ -300,17 +300,32 @@ def test_ingest_counts_feeds_kpi_and_writes_every_call_even_when_empty(env):
     assert p.kpi.sys_wip == 2
 
 
-def test_ingest_same_timestamp_currently_raises_type_error(env):
-    """Records current behavior (suspected bug, not fixed here): EventBuffer sorts (ts, dict)
-    tuples, so two buffered events with an identical timestamp compare dicts and raise."""
+def test_ingest_same_timestamp_events_are_each_processed_once_in_arrival_order(env):
+    """Two events with an identical timestamp: both reach KPI and Neo4j once, in arrival order
+    (this used to raise TypeError and drop the second event)."""
     p = env.ep.EventPipeline(_cfg(), replay_mode=False)
     p.init_session("s")
     env.calls.clear()
-    p.ingest_event(_ev(0, "a"))
-    with pytest.raises(TypeError):
-        p.ingest_event(_ev(0, "b"))
-    assert env.calls == [("write_events_batch", [], "s")]
-    assert p.total_flush_count == 0
+    seen = []
+    orig_on_event = p.kpi.on_event
+    p.kpi.on_event = lambda ev: (seen.append(ev["part_id"]), orig_on_event(ev))
+
+    assert p.ingest_event(_ev(0, "a")) == (0, 0)
+    assert p.ingest_event(_ev(0, "b")) == (0, 0)
+    assert p.ingest_event(_ev(2, "c")) == (2, 0)
+    assert p.ingest_event(_ev(2, "d")) == (0, 0)
+    p.drain_buffer_tail()
+
+    assert seen == ["a", "b", "c", "d"]
+    assert env.calls == [
+        ("write_events_batch", [], "s"),
+        ("write_events_batch", [], "s"),
+        ("write_events_batch", ["a", "b"], "s"),
+        ("write_events_batch", [], "s"),
+        ("write_events_batch", ["c", "d"], "s"),
+    ]
+    assert p.total_flush_count == 4
+    assert p.kpi.sys_wip == 4
 
 
 def test_ingest_forced_flush_logs_warning(env, caplog):
