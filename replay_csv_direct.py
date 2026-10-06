@@ -64,6 +64,62 @@ def load_sorted_events(log_path: str) -> list[dict]:
     return rows
 
 
+def kpi_interval_sec(cfg: dict) -> float:
+    """How often (wall-clock seconds) the replay writes the KPI sidecar."""
+    return float((cfg.get("event_buffer") or {}).get("kpi_print_interval_sec", 2.0))
+
+
+def _sleep_for_original_gap(
+    prev_ts: float | None, time_str: str | None, speed: float
+) -> float | None:
+    """Sleep for this event's gap to the previous one (divided by ``speed``).
+
+    Returns this event's timestamp, or None when it cannot be used as the next reference.
+    No previous reference: short fixed pause (0.05 s). Any error while pacing (bad time,
+    ``speed == 0``): 0.1 s pause and the reference is reset. Negative gaps do not sleep.
+    """
+    if prev_ts is not None and time_str:
+        try:
+            curr = datetime.fromisoformat(str(time_str).strip()).timestamp()
+            delay = (curr - prev_ts) / speed
+            if delay > 0:
+                time.sleep(delay)
+            return curr
+        except Exception:
+            time.sleep(0.1)
+            return None
+
+    try:
+        curr = datetime.fromisoformat(str(time_str).strip()).timestamp()
+    except Exception:
+        curr = None
+    time.sleep(0.05)
+    return curr
+
+
+def replay_events_paced(
+    pipeline: event_pipeline.EventPipeline,
+    events: list[dict],
+    speed: float,
+    kpi_interval: float,
+) -> None:
+    """Feed events through the pipeline at their recorded pacing (gap / ``speed``).
+
+    The KPI sidecar is written right after the first event and then at most every
+    ``kpi_interval`` wall-clock seconds; the caller writes the final ``completed`` state.
+    """
+    next_kpi = time.time()
+    prev_ts: float | None = None
+    for ev in events:
+        prev_ts = _sleep_for_original_gap(prev_ts, ev.get("time"), speed)
+        pipeline.ingest_event(dict(ev))
+
+        now = time.time()
+        if now >= next_kpi:
+            _write_kpi_state(pipeline.kpi_publish_payload())
+            next_kpi = now + kpi_interval
+
+
 def run_replay(log_path: str, speed: float) -> None:
     cfg = common.load_config("config.json")
     pipeline = event_pipeline.EventPipeline(cfg, replay_mode=True)
@@ -86,10 +142,7 @@ def run_replay(log_path: str, speed: float) -> None:
         status="running",
     )
 
-    kpi_interval = float(
-        (cfg.get("event_buffer") or {}).get("kpi_print_interval_sec", 2.0)
-    )
-    next_kpi = time.time()
+    kpi_interval = kpi_interval_sec(cfg)
 
     print(
         "Direct replay: {} events from {} (speed={}x, no MQTT)".format(
@@ -98,33 +151,7 @@ def run_replay(log_path: str, speed: float) -> None:
         flush=True,
     )
     t0 = time.time()
-    prev_ts: float | None = None
-
-    for ev in events:
-        ts_str = ev.get("time")
-        if prev_ts is not None and ts_str:
-            try:
-                curr = datetime.fromisoformat(str(ts_str).strip()).timestamp()
-                delay = (curr - prev_ts) / speed
-                if delay > 0:
-                    time.sleep(delay)
-                prev_ts = curr
-            except Exception:
-                prev_ts = None
-                time.sleep(0.1)
-        else:
-            try:
-                prev_ts = datetime.fromisoformat(str(ts_str).strip()).timestamp()
-            except Exception:
-                prev_ts = None
-            time.sleep(0.05)
-
-        pipeline.ingest_event(dict(ev))
-
-        now = time.time()
-        if now >= next_kpi:
-            _write_kpi_state(pipeline.kpi_publish_payload())
-            next_kpi = now + kpi_interval
+    replay_events_paced(pipeline, events, speed, kpi_interval)
 
     pipeline.drain_buffer_tail()
     neo4j_writer.finalize_session(

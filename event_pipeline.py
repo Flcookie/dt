@@ -77,6 +77,23 @@ class EventPipeline:
         sid = (session_id or "").strip()
         self._session_id = sid if sid else None
 
+    def _start_new_live_session(self, description: str) -> str:
+        """Create a running Neo4j Session, switch to it, and restart buffer + KPI from empty.
+
+        If the Neo4j call fails, the current session, buffer and KPI are left untouched.
+        """
+        sid = common.new_event_log_session_id()
+        neo4j_writer.start_session(
+            sid,
+            description,
+            start_time_iso=datetime.now().isoformat(),
+            status="running",
+        )
+        self._session_id = sid
+        self.buffer.clear()
+        self.kpi.reset()
+        return sid
+
     def process_command(self, cmd: dict[str, Any]) -> None:
         action = cmd.get("action")
         if action == "reset_kpi":
@@ -84,43 +101,17 @@ class EventPipeline:
             self.kpi.reset()
             _log.info("KPI reset")
         elif action == "start_new_session":
-            sid = common.new_event_log_session_id()
             desc = str(cmd.get("description", "") or "live")
-            neo4j_writer.start_session(
-                sid,
-                desc,
-                start_time_iso=datetime.now().isoformat(),
-                status="running",
-            )
-            self._session_id = sid
-            self.buffer.clear()
-            self.kpi.reset()
+            sid = self._start_new_live_session(desc)
             _log.info("New session: %s", sid)
         elif action == "reset_all":
-            sid = common.new_event_log_session_id()
             desc = str(cmd.get("description", "") or "live")
-            neo4j_writer.start_session(
-                sid,
-                desc,
-                start_time_iso=datetime.now().isoformat(),
-                status="running",
-            )
-            self._session_id = sid
-            self.buffer.clear()
-            self.kpi.reset()
-            _log.info("Reset All: new session %s %s", sid, desc or "")
+            sid = self._start_new_live_session(desc)
+            _log.info("Reset All: new session %s %s", sid, desc)
         elif action == "clear_neo4j":
             neo4j_writer.clear_all_events()
-            sid = common.new_event_log_session_id()
-            neo4j_writer.start_session(
-                sid,
-                "live",
-                start_time_iso=datetime.now().isoformat(),
-                status="running",
-            )
-            self._session_id = sid
-            self.buffer.clear()
-            self.kpi.reset()
+            # Description is always "live" here; cmd["description"] is ignored.
+            sid = self._start_new_live_session("live")
             _log.info("Neo4j cleared, new session: %s", sid)
         elif action == "finalize_session":
             sid = str(cmd.get("session_id") or self._session_id or "")
@@ -140,34 +131,35 @@ class EventPipeline:
                 self.buffer.window_ms,
                 self.buffer.max_size,
             )
-        n = len(ready_events)
-        self._last_flush_count = n
-        self.flush_since_last_print += n
-        self.total_flush_count += n
-        for ev in ready_events:
-            self.kpi.on_event(ev)
-        if self.persist_neo4j:
-            try:
-                neo4j_writer.write_events_batch(ready_events, self._session_id)
-            except Exception as e:
-                _log.error("Neo4j write error（KPI 已更新，图库未写入）: %s", e)
-        return n, n_forced
+        # Called even when nothing is ready (write_events_batch ignores an empty list).
+        self._process_ready_events(
+            ready_events, "Neo4j write error（KPI 已更新，图库未写入）: %s"
+        )
+        return len(ready_events), n_forced
 
     def drain_buffer_tail(self) -> None:
         """After ordered replay, flush any events still inside the time window."""
         ready = self.buffer.drain_all_ordered()
         if not ready:
             return
-        self._last_flush_count = len(ready)
-        self.flush_since_last_print += len(ready)
-        self.total_flush_count += len(ready)
+        self._process_ready_events(ready, "Neo4j tail flush error: %s")
+
+    def _process_ready_events(self, ready: list[dict], neo4j_error_log: str) -> None:
+        """Update flush counters, feed KPI in time order, then persist the same batch.
+
+        A Neo4j failure is only logged (with ``neo4j_error_log``): KPI is already updated.
+        """
+        n = len(ready)
+        self._last_flush_count = n
+        self.flush_since_last_print += n
+        self.total_flush_count += n
         for ev in ready:
             self.kpi.on_event(ev)
         if self.persist_neo4j:
             try:
                 neo4j_writer.write_events_batch(ready, self._session_id)
             except Exception as e:
-                _log.error("Neo4j tail flush error: %s", e)
+                _log.error(neo4j_error_log, e)
 
     def get_snapshot(self) -> dict[str, Any]:
         return self.kpi.get_snapshot()

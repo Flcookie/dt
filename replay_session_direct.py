@@ -10,7 +10,6 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
@@ -23,7 +22,11 @@ import common  # noqa: E402
 import event_pipeline  # noqa: E402
 import services.neo4j_backend as neo4j_backend  # noqa: E402
 import neo4j_writer  # noqa: E402
-from replay_csv_direct import _write_kpi_state  # noqa: E402
+from replay_csv_direct import (  # noqa: E402
+    _write_kpi_state,
+    kpi_interval_sec,
+    replay_events_paced,
+)
 
 _log = logging.getLogger("replay_session_direct")
 
@@ -45,10 +48,7 @@ def run_replay_from_neo4j_session(source_session_id: str, speed: float) -> None:
     )
     pipeline.attach_existing_session_kpi_only(sid_src)
 
-    kpi_interval = float(
-        (cfg.get("event_buffer") or {}).get("kpi_print_interval_sec", 2.0)
-    )
-    next_kpi = time.time()
+    kpi_interval = kpi_interval_sec(cfg)
 
     print(
         "Session replay: {} events, session={} (KPI only, no Neo4j write; speed={}x)".format(
@@ -57,33 +57,7 @@ def run_replay_from_neo4j_session(source_session_id: str, speed: float) -> None:
         flush=True,
     )
     t0 = time.time()
-    prev_ts: float | None = None
-
-    for ev in events:
-        ts_str = ev.get("time")
-        if prev_ts is not None and ts_str:
-            try:
-                curr = datetime.fromisoformat(str(ts_str).strip()).timestamp()
-                delay = (curr - prev_ts) / speed
-                if delay > 0:
-                    time.sleep(delay)
-                prev_ts = curr
-            except Exception:
-                prev_ts = None
-                time.sleep(0.1)
-        else:
-            try:
-                prev_ts = datetime.fromisoformat(str(ts_str).strip()).timestamp()
-            except Exception:
-                prev_ts = None
-            time.sleep(0.05)
-
-        pipeline.ingest_event(dict(ev))
-
-        now = time.time()
-        if now >= next_kpi:
-            _write_kpi_state(pipeline.kpi_publish_payload(), completed=False)
-            next_kpi = now + kpi_interval
+    replay_events_paced(pipeline, events, speed, kpi_interval)
 
     pipeline.drain_buffer_tail()
     _write_kpi_state(pipeline.kpi_publish_payload(), completed=True)
