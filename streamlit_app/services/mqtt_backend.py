@@ -106,6 +106,28 @@ def _live_prefers_mqtt_over_replay() -> bool:
         return False
 
 
+def _usable_replay_sidecar() -> dict | None:
+    """Content of ``.replay_kpi.json`` if the dashboard may use it, else None.
+
+    None in Live Monitoring mode (MQTT only), or when the file is missing, unreadable,
+    or not usable per ``_replay_blob_usable``. A returned blob always has a ``t`` that
+    converts to a positive float and a non-empty dict ``data``.
+    """
+    if _live_prefers_mqtt_over_replay():
+        return None
+    try:
+        rp = _replay_kpi_file()
+        if not os.path.isfile(rp):
+            return None
+        with open(rp, encoding="utf-8") as f:
+            blob = json.load(f)
+        if _replay_blob_usable(blob):
+            return blob
+    except Exception:
+        pass
+    return None
+
+
 def physical_kpi_session_id() -> str | None:
     """Live lab: session_id from latest KPI payload when ``run_mode`` is physical (main_service).
 
@@ -127,24 +149,11 @@ def physical_kpi_session_id() -> str | None:
 
 def get_replay_pipeline_session_id() -> str | None:
     """Neo4j session id from replay worker KPI sidecar (ignored in Live Monitoring mode)."""
-    if _live_prefers_mqtt_over_replay():
+    blob = _usable_replay_sidecar()
+    if blob is None:
         return None
-    try:
-        rp = _replay_kpi_file()
-        if not os.path.isfile(rp):
-            return None
-        with open(rp, encoding="utf-8") as f:
-            blob = json.load(f)
-        if not _replay_blob_usable(blob):
-            return None
-        data = blob.get("data")
-        if isinstance(data, dict):
-            sid = data.get("session_id")
-            if sid:
-                return str(sid)
-    except Exception:
-        pass
-    return None
+    sid = blob["data"].get("session_id")
+    return str(sid) if sid else None
 
 
 def resolve_digital_twin_neo4j_session_id() -> str | None:
@@ -366,16 +375,8 @@ def wait_for_control_mqtt(timeout_sec: float = 25.0) -> None:
 
 def kpi_connected() -> bool:
     """KPI source: MQTT from main_service, or (non-Live mode only) direct replay sidecar."""
-    if not _live_prefers_mqtt_over_replay():
-        try:
-            rp = _replay_kpi_file()
-            if os.path.isfile(rp):
-                with open(rp, encoding="utf-8") as f:
-                    blob = json.load(f)
-                if _replay_blob_usable(blob):
-                    return True
-        except Exception:
-            pass
+    if _usable_replay_sidecar() is not None:
+        return True
     if not _mqtt_kpi_connected:
         return False
     now = time.time()
@@ -421,18 +422,9 @@ def get_kpi_snapshot() -> tuple[dict, float]:
     **Live Monitoring** (``cp_data_source == "live"``): MQTT only — never ``.replay_kpi.json``.
     Otherwise: prefer usable replay sidecar, then MQTT buffer.
     """
-    if not _live_prefers_mqtt_over_replay():
-        try:
-            rp = _replay_kpi_file()
-            if os.path.isfile(rp):
-                with open(rp, encoding="utf-8") as f:
-                    blob = json.load(f)
-                t = float(blob.get("t", 0))
-                data = blob.get("data")
-                if isinstance(data, dict) and data and _replay_blob_usable(blob):
-                    return dict(data), t
-        except Exception:
-            pass
+    blob = _usable_replay_sidecar()
+    if blob is not None:
+        return dict(blob["data"]), float(blob["t"])
     with _kpi_lock:
         return dict(_latest_kpi), _last_kpi_time
 
@@ -479,11 +471,14 @@ def publish_main_service_command(action: str, **kwargs):
         raise RuntimeError("MQTT publish failed (rc={})".format(info.rc))
 
 
-def run_replay_subprocess(csv_path: str, speed: float) -> subprocess.Popen:
-    """Run replay_csv_direct.py: CSV -> buffer/KPI/Neo4j (no MQTT event publish)."""
+def _start_replay_worker(script_name: str, *script_args: str) -> subprocess.Popen:
+    """Start a replay worker script in the repo root with the dashboard's CONFIG_FILE.
+
+    On Windows the worker gets no console window (when the flag is available).
+    """
     from paths import PROJECT_ROOT
 
-    script = os.path.join(PROJECT_ROOT, "replay_csv_direct.py")
+    script = os.path.join(PROJECT_ROOT, script_name)
     env = os.environ.copy()
     env["CONFIG_FILE"] = active_config_name()
     kw: dict = {}
@@ -493,29 +488,20 @@ def run_replay_subprocess(csv_path: str, speed: float) -> subprocess.Popen:
         except AttributeError:
             pass
     return subprocess.Popen(
-        [sys.executable, script, csv_path, str(speed)],
+        [sys.executable, script, *script_args],
         cwd=PROJECT_ROOT,
         env=env,
         **kw,
     )
 
 
+def run_replay_subprocess(csv_path: str, speed: float) -> subprocess.Popen:
+    """Run replay_csv_direct.py: CSV -> buffer/KPI/Neo4j (no MQTT event publish)."""
+    return _start_replay_worker("replay_csv_direct.py", csv_path, str(speed))
+
+
 def run_replay_session_subprocess(source_session_id: str, speed: float) -> subprocess.Popen:
     """Run replay_session_direct.py: read events from existing Session, KPI replay only (no new Neo4j session)."""
-    from paths import PROJECT_ROOT
-
-    script = os.path.join(PROJECT_ROOT, "replay_session_direct.py")
-    env = os.environ.copy()
-    env["CONFIG_FILE"] = active_config_name()
-    kw: dict = {}
-    if sys.platform == "win32":
-        try:
-            kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-        except AttributeError:
-            pass
-    return subprocess.Popen(
-        [sys.executable, script, str(source_session_id), str(speed)],
-        cwd=PROJECT_ROOT,
-        env=env,
-        **kw,
+    return _start_replay_worker(
+        "replay_session_direct.py", str(source_session_id), str(speed)
     )
