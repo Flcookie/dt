@@ -177,3 +177,40 @@ def test_rates_fall_back_to_departure_history(dash):
     assert rates["Completion"]["x"] == [_ts(-2), _ts(20), _ts(40), _ts(42)]
     assert rates["Completion"]["y"] == [0.0, 3.0, 3.0, 3.0]  # 1/20 s and 2/40 s -> 3 pcs/min
     assert rates["Scrap"]["y"] == [0.0, 0.0, 1.5, 1.5]  # 1/40 s -> 1.5 pcs/min
+
+
+def test_station_section_without_any_station_shows_message(dash, monkeypatch):
+    monkeypatch.setattr(kpi_display, "default_station_ids", lambda: ())
+    at = dash({})
+    assert [t.value for t in at.text] == ["No station* list in config."]
+    assert len(at.get("plotly_chart")) == 2  # trend charts only, no fraction bars
+    titles = [m.value for m in at.markdown if m.value.startswith('<p class="kpi-sec-title kpi-sec-title--station"')]
+    assert len(titles) == 1
+
+
+def test_station_states_and_fraction_bars(dash, monkeypatch):
+    monkeypatch.setattr(kpi_display, "default_station_ids", lambda: ())  # stations known from the snapshot
+    kpi = {
+        "station_live": {"station11": {"current_state": "busy"}, "station21": {"current_state": "weird"},
+                         "station99": {"current_state": "FAIL"}},
+        "state_probability": {"station11": {"busy": 0.6, "idle": 0.4}, "station31": {"fail": 0.25, "blocked": 0.5},
+                              "station41": {"BUSY": 1.0}, "station99": {"busy": 1.0}},
+    }
+    at = dash(kpi)
+    (state_box,) = [m.value for m in at.markdown if m.value.startswith('<div class="kpi-station-state-box">')]
+    # fixed order of the nine mainline stations; station99 is not shown
+    names = ["M1-1", "M2-1", "M2-2", "M3-1", "M4-1", "M5-1", "M5-2", "M6-1", "M7-1"]
+    positions = [state_box.index(">{}<".format(n)) for n in names]
+    assert positions == sorted(positions) and "station99" not in state_box
+    assert '<span style="color:#22c55e;font-size:15px">●</span>' in state_box  # busy, case-insensitive
+    assert '<span style="color:#94a3b8;font-size:15px">○</span>' in state_box  # unknown state: hollow, idle colour
+    assert ">Weird<" in state_box and state_box.count(">Idle<") == 7
+    bars = {key: _chart(at, key)["data"][0] for key in
+            ("kpi_station_idle_bar", "kpi_station_busy_bar", "kpi_station_fail_bar", "kpi_station_blocked_bar")}
+    assert bars["kpi_station_busy_bar"]["x"] == names
+    assert bars["kpi_station_busy_bar"]["y"] == [60.0, 0, 0, 0, 0, 0, 0, 0, 0]  # 'BUSY' key is not read
+    assert bars["kpi_station_idle_bar"]["y"] == [40.0, 0, 0, 0, 0, 0, 0, 0, 0]
+    assert bars["kpi_station_fail_bar"]["y"] == [0, 0, 0, 25.0, 0, 0, 0, 0, 0]
+    assert bars["kpi_station_blocked_bar"]["y"] == [0, 0, 0, 50.0, 0, 0, 0, 0, 0]
+    order = [e.proto.id.rsplit("-", 1)[-1] for e in at.get("plotly_chart")][2:]
+    assert order == ["kpi_station_idle_bar", "kpi_station_busy_bar", "kpi_station_fail_bar", "kpi_station_blocked_bar"]

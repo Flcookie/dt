@@ -349,6 +349,126 @@ def _station_compact_card_html(
     )
 
 
+# The State box and the fraction bars always list these nine mainline stations, in this order.
+# The configured / snapshot station list only decides whether the section has anything to show.
+_STATION_KPI_ORDER: tuple[str, ...] = (
+    "station11",
+    "station21",
+    "station22",
+    "station31",
+    "station41",
+    "station51",
+    "station52",
+    "station61",
+    "station71",
+)
+
+# station_live ``current_state`` (upper-cased) -> pill colour. Any other state is shown with a
+# hollow dot in the Idle colour.
+_STATION_STATE_COLORS: dict[str, str] = {
+    "BUSY": _STATION_BUSY_COLOR,
+    "FAIL": _STATION_FAIL_COLOR,
+    "BLOCKED": _STATION_BLOCKED_COLOR,
+    "IDLE": _STATION_IDLE_COLOR,
+}
+
+# 2x2 fraction bars, filled row by row (Idle, Busy / Failed, Blocked):
+# (state_probability key, chart title, bar colour, hover label, widget key)
+_STATION_FRACTION_BARS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("idle", "Idle fraction (%)", _STATION_IDLE_COLOR, "Idle", "kpi_station_idle_bar"),
+    ("busy", "Busy fraction (%)", _STATION_BUSY_COLOR, "Busy", "kpi_station_busy_bar"),
+    ("fail", "Failed fraction (%)", _STATION_FAIL_COLOR, "Failed", "kpi_station_fail_bar"),
+    ("blocked", "Blocked fraction (%)", _STATION_BLOCKED_COLOR, "Blocked", "kpi_station_blocked_bar"),
+)
+
+_STATION_BAR_HOVERLABEL = dict(
+    bgcolor="#1e2a3a",
+    font_size=_FONT_L5_PX,
+    font_family=_PLOT_FONT,
+    font_color="#e0e6f0",
+    bordercolor="#444c56",
+)
+
+
+def _station_state_pill_html(station_id: str, live: dict) -> str:
+    """One pill of the State box: dot, display name (M1-1 …) and ``current_state`` (default IDLE)."""
+    state = str(live.get("current_state") or "IDLE").upper()
+    color = _STATION_STATE_COLORS.get(state, _STATION_IDLE_COLOR)
+    dot = "●" if state in _STATION_STATE_COLORS else "○"
+    name = station_kpi_display_name(station_id)
+    return (
+        '<span style="display:inline-flex;align-items:center;justify-content:center;gap:6px;'
+        f'background:{_UI_THEME["surface2"]};border-radius:18px;padding:7px 12px;'
+        f'margin:0;font-size:{_FONT_L3_PX}px;width:100%;box-sizing:border-box;">'
+        f'<span style="color:{color};font-size:{_FONT_L3_PX}px">{dot}</span>'
+        f'<span style="color:{_UI_THEME["text"]};font-weight:700;font-size:{_FONT_L3_PX}px">{html.escape(name)}</span>'
+        f'<span style="color:{color};font-size:{_FONT_L3_PX}px">{html.escape(state.capitalize())}</span>'
+        "</span>"
+    )
+
+
+def _state_fraction_percents(state_probability: dict, state: str) -> list[float]:
+    """Time share of ``state`` in percent per station of ``_STATION_KPI_ORDER``.
+
+    Reads the lower-case key only; a missing station or key counts as 0.
+    """
+    return [
+        float((state_probability.get(sid) or {}).get(state, 0) or 0) * 100
+        for sid in _STATION_KPI_ORDER
+    ]
+
+
+def _station_fraction_bar_figure(
+    station_names: list[str],
+    percents: list[float],
+    title: str,
+    color: str,
+    hover_label: str,
+) -> go.Figure:
+    """Bar per station with its percentage written above every non-zero bar."""
+    n = len(station_names)
+    fig = go.Figure(
+        go.Bar(
+            x=station_names,
+            y=percents,
+            marker_color=color,
+            customdata=[hover_label] * n,
+            hovertemplate="<b>%{x}</b><br>%{customdata}: %{y:.1f}<extra></extra>",
+        )
+    )
+    y_max = max(105.0, max(percents, default=0) + 8.0)
+    for name, pct in zip(station_names, percents):
+        if pct > 0:
+            fig.add_annotation(
+                x=name,
+                y=pct + 1.0,
+                text="{:.0f}".format(pct),
+                showarrow=False,
+                font=dict(size=_FONT_L5_PX, color=color, family=_PLOT_FONT),
+                yanchor="bottom",
+            )
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=_FONT_CHART_TITLE_PX, family=_PLOT_FONT)),
+        height=200,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#f8f9fa",
+        margin=dict(t=36, b=40, l=8, r=10),
+        yaxis=dict(
+            range=[0, y_max],
+            showticklabels=False,
+            showline=False,
+            showgrid=False,
+            zeroline=False,
+            ticks="",
+        ),
+        xaxis=dict(tickfont=dict(size=_FONT_CHART_AXIS_PX)),
+        font=dict(size=_FONT_CHART_AXIS_PX, color=_UI_THEME["text_dim"], family=_PLOT_FONT),
+        showlegend=False,
+        hoverlabel=_STATION_BAR_HOVERLABEL,
+    )
+    return fig
+
+
 def render_station_card_grid(
     kpi: dict | None,
     *,
@@ -357,61 +477,33 @@ def render_station_card_grid(
     compact: bool = True,
     station_ids: tuple[str, ...] | None = None,
 ) -> None:
+    """Station KPI section: a State box (one pill per station from ``station_live``) and four
+    fraction bars (from ``state_probability``), always for ``_STATION_KPI_ORDER``.
+
+    ``station_ids`` (default: stations from config.json) plus the stations in
+    ``state_probability`` only decide whether there is anything to show.
+    """
     _ = age_sec
-    k = dict(kpi or {})
-    probs = dict(k.get("state_probability") or {})
-    live_all = dict(k.get("station_live") or {})
-    defaults = station_ids if station_ids is not None else default_station_ids()
-    stations = sorted(set(defaults) | set(probs.keys()))
+    snapshot = dict(kpi or {})
+    state_probability = dict(snapshot.get("state_probability") or {})
+    live_by_station = dict(snapshot.get("station_live") or {})
+    configured = station_ids if station_ids is not None else default_station_ids()
+    known_stations = sorted(set(configured) | set(state_probability.keys()))
     st.markdown(
         "<hr style='border:none;border-top:1px solid #e2e8f0;margin:14px 0 10px 0;'>",
         unsafe_allow_html=True,
     )
-    if not stations:
-        st.markdown(
-            _kpi_section_title_html("Station KPI", "station"),
-            unsafe_allow_html=True,
-        )
-        st.text("No station* list in config.")
-        return
     st.markdown(
         _kpi_section_title_html("Station KPI", "station"),
         unsafe_allow_html=True,
     )
-    station_order = [
-        "station11",
-        "station21",
-        "station22",
-        "station31",
-        "station41",
-        "station51",
-        "station52",
-        "station61",
-        "station71",
-    ]
-    state_color = {
-        "BUSY": _STATION_BUSY_COLOR,
-        "FAIL": _STATION_FAIL_COLOR,
-        "BLOCKED": _STATION_BLOCKED_COLOR,
-        "IDLE": _STATION_IDLE_COLOR,
-    }
-    state_dot = {"BUSY": "●", "FAIL": "●", "BLOCKED": "●", "IDLE": "●"}
-    pills = ""
-    for sid in station_order:
-        live = live_all.get(sid) or {}
-        state = str(live.get("current_state") or "IDLE").upper()
-        color = state_color.get(state, _STATION_IDLE_COLOR)
-        dot = state_dot.get(state, "○")
-        name = station_kpi_display_name(sid)
-        pills += (
-            '<span style="display:inline-flex;align-items:center;justify-content:center;gap:6px;'
-            f'background:{_UI_THEME["surface2"]};border-radius:18px;padding:7px 12px;'
-            f'margin:0;font-size:{_FONT_L3_PX}px;width:100%;box-sizing:border-box;">'
-            f'<span style="color:{color};font-size:{_FONT_L3_PX}px">{dot}</span>'
-            f'<span style="color:{_UI_THEME["text"]};font-weight:700;font-size:{_FONT_L3_PX}px">{html.escape(name)}</span>'
-            f'<span style="color:{color};font-size:{_FONT_L3_PX}px">{html.escape(state.capitalize())}</span>'
-            "</span>"
-        )
+    if not known_stations:
+        st.text("No station* list in config.")
+        return
+
+    pills = "".join(
+        _station_state_pill_html(sid, live_by_station.get(sid) or {}) for sid in _STATION_KPI_ORDER
+    )
     st.markdown(
         (
             '<div class="kpi-station-state-box">'
@@ -427,116 +519,25 @@ def render_station_card_grid(
         unsafe_allow_html=True,
     )
 
-    # 2x2 station comparison bars (Idle / Busy / Blocked / Failed)
-    state_probs = dict(k.get("state_probability") or {})
-    labels = [station_kpi_display_name(s) for s in station_order]
-    busy_vals = [float((state_probs.get(s) or {}).get("busy", 0) or 0) * 100 for s in station_order]
-    fail_vals = [float((state_probs.get(s) or {}).get("fail", 0) or 0) * 100 for s in station_order]
-    blocked_vals = [float((state_probs.get(s) or {}).get("blocked", 0) or 0) * 100 for s in station_order]
-    idle_vals = [float((state_probs.get(s) or {}).get("idle", 0) or 0) * 100 for s in station_order]
-
-    _STATION_HOVER = dict(
-        bgcolor="#1e2a3a",
-        font_size=_FONT_L5_PX,
-        font_family=_PLOT_FONT,
-        font_color="#e0e6f0",
-        bordercolor="#444c56",
-    )
-
-    def _make_station_bar(
-        title: str,
-        values: list[float],
-        color: str,
-        metric_name: str,
-    ) -> go.Figure:
-        n = len(labels)
-        fig = go.Figure(
-            go.Bar(
-                x=labels,
-                y=values,
-                marker_color=color,
-                customdata=[metric_name] * n,
-                hovertemplate="<b>%{x}</b><br>%{customdata}: %{y:.1f}<extra></extra>",
-            )
-        )
-        y_max = max(105.0, max(values, default=0) + 8.0)
-        for lb, val in zip(labels, values):
-            if val > 0:
-                fig.add_annotation(
-                    x=lb,
-                    y=val + 1.0,
-                    text="{:.0f}".format(val),
-                    showarrow=False,
-                    font=dict(size=_FONT_L5_PX, color=color, family=_PLOT_FONT),
-                    yanchor="bottom",
-                )
-        fig.update_layout(
-            title=dict(text=title, font=dict(size=_FONT_CHART_TITLE_PX, family=_PLOT_FONT)),
-            height=200,
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="#f8f9fa",
-            margin=dict(t=36, b=40, l=8, r=10),
-            yaxis=dict(
-                range=[0, y_max],
-                showticklabels=False,
-                showline=False,
-                showgrid=False,
-                zeroline=False,
-                ticks="",
-            ),
-            xaxis=dict(tickfont=dict(size=_FONT_CHART_AXIS_PX)),
-            font=dict(size=_FONT_CHART_AXIS_PX, color=_UI_THEME["text_dim"], family=_PLOT_FONT),
-            showlegend=False,
-            hoverlabel=_STATION_HOVER,
-        )
-        return fig
-
+    # All values are read before the chart area is drawn (a bad value fails here, as before).
+    station_names = [station_kpi_display_name(sid) for sid in _STATION_KPI_ORDER]
+    percents_by_state = {
+        state: _state_fraction_percents(state_probability, state)
+        for state in ("busy", "fail", "blocked", "idle")
+    }
     st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
     with st.container(key="kpi_station_fractions_wrap"):
-        row1_col1, row1_col2 = st.columns(2)
-        row2_col1, row2_col2 = st.columns(2)
-        with row1_col1:
-            st.plotly_chart(
-                _make_station_bar(
-                    "Idle fraction (%)", idle_vals, _STATION_IDLE_COLOR, "Idle"
-                ),
-                use_container_width=True,
-                config={"displayModeBar": False},
-                key="kpi_station_idle_bar",
-            )
-        with row1_col2:
-            st.plotly_chart(
-                _make_station_bar(
-                    "Busy fraction (%)", busy_vals, _STATION_BUSY_COLOR, "Busy"
-                ),
-                use_container_width=True,
-                config={"displayModeBar": False},
-                key="kpi_station_busy_bar",
-            )
-        with row2_col1:
-            st.plotly_chart(
-                _make_station_bar(
-                    "Failed fraction (%)",
-                    fail_vals,
-                    _STATION_FAIL_COLOR,
-                    "Failed",
-                ),
-                use_container_width=True,
-                config={"displayModeBar": False},
-                key="kpi_station_fail_bar",
-            )
-        with row2_col2:
-            st.plotly_chart(
-                _make_station_bar(
-                    "Blocked fraction (%)",
-                    blocked_vals,
-                    _STATION_BLOCKED_COLOR,
-                    "Blocked",
-                ),
-                use_container_width=True,
-                config={"displayModeBar": False},
-                key="kpi_station_blocked_bar",
-            )
+        grid_cells = [*st.columns(2), *st.columns(2)]
+        for cell, (state, title, color, hover_label, key) in zip(grid_cells, _STATION_FRACTION_BARS):
+            with cell:
+                st.plotly_chart(
+                    _station_fraction_bar_figure(
+                        station_names, percents_by_state[state], title, color, hover_label
+                    ),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=key,
+                )
 
 
 def _system_values(kpi: dict) -> dict[str, float | int]:
