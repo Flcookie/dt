@@ -18,24 +18,14 @@ except ImportError:
 import event_pipeline
 import neo4j_writer
 
-# 与 Streamlit / replay 脚本一致：可用 CONFIG_FILE=config_lab.json 指向实验室配置
-CONFIG = common.load_config(os.environ.get("CONFIG_FILE", "config.json"))
-MQTT_BROKER_HOST = CONFIG["mqtt_broker_host"]
-MQTT_BROKER_PORT = CONFIG["mqtt_broker_port"]
-BUFFER_CFG = CONFIG.get("event_buffer", {})
-_replay_mode = "--replay" in sys.argv
-pipeline = event_pipeline.EventPipeline(CONFIG, replay_mode=_replay_mode)
-_last_flush_count = 0
-
 PID_FILE = os.path.normpath(os.path.join(os.path.dirname(__file__), "main_service.pid"))
-LOG_FOLDER = CONFIG.get("log_folder", "event-logs")
-os.makedirs(LOG_FOLDER, exist_ok=True)
-LOG_TIME = datetime.now().strftime("%y%m%d_%H%M%S")
-LOG_FILE = "kpi_log_{}.txt".format(LOG_TIME)
-LOG_PATH = os.path.normpath(os.path.join(LOG_FOLDER, LOG_FILE))
-APP_LOG_PATH = os.path.normpath(os.path.join(LOG_FOLDER, "main_service_{}.log".format(LOG_TIME)))
 
-logger = common.setup_logger("main_service", logging.INFO, log_file=APP_LOG_PATH)
+# Set by main(). Shared with the MQTT callbacks, which run on paho's network thread, and with
+# the KPI report on the main thread.
+pipeline: event_pipeline.EventPipeline | None = None
+_last_flush_count = 0
+# Console + app-log handlers are attached in main() (common.setup_logger on this logger).
+logger = logging.getLogger("main_service")
 
 
 def _check_single_instance():
@@ -187,42 +177,39 @@ def _log_kpi_report(snap: dict, log_file=None):
         log_file.flush()
 
 
-_check_single_instance()
-
-_sid0 = common.new_event_log_session_id()
-try:
-    pipeline.init_session(_sid0, "live", start_time_iso=datetime.now().isoformat())
-    logger.info("Neo4j init OK, session: %s", _sid0)
-except Exception as e:
-    logger.error("Neo4j init error: %s", e)
-
-mqtt_client = mqtt.Client()
-mqtt_client.on_connect = on_connect
-mqtt_client.on_disconnect = on_disconnect
-mqtt_client.on_message = on_message
-mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
-mqtt_client.connect(MQTT_BROKER_HOST, port=MQTT_BROKER_PORT)
-mqtt_client.loop_start()
-
-# KPI 记录/发布间隔：event_buffer.kpi_print_interval_sec，默认 2 秒；replay 模式也用同一间隔
-# （replay 只把 buffer 窗口换成 replay_window_ms）。
-KPI_PRINT_INTERVAL = BUFFER_CFG.get("kpi_print_interval_sec", 2.0)
-
-kpi_log_file = open(LOG_PATH, "w", encoding="utf-8")
+def _start_live_session():
+    """Create this run's live Session in Neo4j; on failure only log (events are still processed)."""
+    session_id = common.new_event_log_session_id()
+    try:
+        pipeline.init_session(session_id, "live", start_time_iso=datetime.now().isoformat())
+        logger.info("Neo4j init OK, session: %s", session_id)
+    except Exception as e:
+        logger.error("Neo4j init error: %s", e)
 
 
-def _log(msg: str):
+def _connect_mqtt(host, port) -> mqtt.Client:
+    """Connect to the broker and start paho's network thread (callbacks run there)."""
+    client = mqtt.Client()
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    client.reconnect_delay_set(min_delay=1, max_delay=120)
+    client.connect(host, port=port)
+    client.loop_start()
+    return client
+
+
+def _log(kpi_log_file, msg: str):
     logger.info(msg)
     kpi_log_file.write(msg + "\n")
     kpi_log_file.flush()
 
 
-_log("[main_service] Started. Buffer + Neo4j + KPI. Ctrl+C to stop.")
-_log("[main_service] KPI log: {}".format(LOG_PATH))
-_log("[main_service] App log: {}".format(APP_LOG_PATH))
-try:
+def _run_kpi_loop(mqtt_client, interval, kpi_log_file):
+    """Every ``interval`` seconds: log the KPI report, reset the per-interval flush count and
+    publish the KPI payload for the dashboard. Runs until interrupted."""
     while True:
-        time.sleep(KPI_PRINT_INTERVAL)
+        time.sleep(interval)
         snap = pipeline.get_snapshot()
         _log_kpi_report(snap, kpi_log_file)
         pipeline.flush_since_last_print = 0  # reset for next interval
@@ -234,9 +221,10 @@ try:
             mqtt_client.publish(topic, common.serialize_object(pub), qos=0)
         except Exception as e:
             logger.error("KPI publish error: %s", e)
-except KeyboardInterrupt:
-    pass
-finally:
+
+
+def _shutdown(mqtt_client, kpi_log_file):
+    """Stop MQTT, close Neo4j, remove the PID file and close the KPI log."""
     mqtt_client.loop_stop()
     mqtt_client.disconnect()
     neo4j_writer.close()
@@ -245,5 +233,50 @@ finally:
             os.remove(PID_FILE)
     except OSError:
         pass
-    _log("[main_service] Stopped.")
+    _log(kpi_log_file, "[main_service] Stopped.")
     kpi_log_file.close()
+
+
+def main():
+    """Start the service, run the KPI loop until Ctrl+C, then clean up.
+
+    Only the KPI loop is covered by the cleanup (as before): a failure while starting up
+    (e.g. MQTT connect) leaves the PID file in place.
+    """
+    global pipeline
+    # 与 Streamlit / replay 脚本一致：可用 CONFIG_FILE=config_lab.json 指向实验室配置
+    config = common.load_config(os.environ.get("CONFIG_FILE", "config.json"))
+    mqtt_broker_host = config["mqtt_broker_host"]
+    mqtt_broker_port = config["mqtt_broker_port"]
+    buffer_cfg = config.get("event_buffer", {})
+    replay_mode = "--replay" in sys.argv
+    pipeline = event_pipeline.EventPipeline(config, replay_mode=replay_mode)
+
+    log_folder = config.get("log_folder", "event-logs")
+    os.makedirs(log_folder, exist_ok=True)
+    log_time = datetime.now().strftime("%y%m%d_%H%M%S")
+    kpi_log_path = os.path.normpath(os.path.join(log_folder, "kpi_log_{}.txt".format(log_time)))
+    app_log_path = os.path.normpath(os.path.join(log_folder, "main_service_{}.log".format(log_time)))
+    common.setup_logger("main_service", logging.INFO, log_file=app_log_path)
+
+    _check_single_instance()
+    _start_live_session()
+    mqtt_client = _connect_mqtt(mqtt_broker_host, mqtt_broker_port)
+
+    # KPI 记录/发布间隔：event_buffer.kpi_print_interval_sec，默认 2 秒；replay 模式也用同一间隔
+    # （replay 只把 buffer 窗口换成 replay_window_ms）。
+    kpi_interval = buffer_cfg.get("kpi_print_interval_sec", 2.0)
+    kpi_log_file = open(kpi_log_path, "w", encoding="utf-8")
+    _log(kpi_log_file, "[main_service] Started. Buffer + Neo4j + KPI. Ctrl+C to stop.")
+    _log(kpi_log_file, "[main_service] KPI log: {}".format(kpi_log_path))
+    _log(kpi_log_file, "[main_service] App log: {}".format(app_log_path))
+    try:
+        _run_kpi_loop(mqtt_client, kpi_interval, kpi_log_file)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _shutdown(mqtt_client, kpi_log_file)
+
+
+if __name__ == "__main__":
+    main()

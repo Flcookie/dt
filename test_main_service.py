@@ -331,3 +331,91 @@ def test_mqtt_connect_failure_escapes_and_leaves_the_pid_file(service):
     assert isinstance(svc.error, ConnectionRefusedError)
     assert os.path.exists(svc.pid_path)  # current behavior: no cleanup before the KPI loop starts
     assert [c[0] for c in svc.calls] == ["neo4j.start_session", "reconnect_delay_set", "connect"]
+
+
+# ---- importing the module (main() is only called when run as a script) ----------------------
+
+
+@pytest.fixture
+def ms_module(tmp_path, monkeypatch):
+    """main_service imported fresh with the fake MQTT client and neo4j_writer installed."""
+    svc = Service(tmp_path, monkeypatch)
+    svc._fakes()
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"mqtt_broker_host": "127.0.0.1", "mqtt_broker_port": 1883,
+                                    "log_folder": str(tmp_path / "logs")}))
+    monkeypatch.setenv("CONFIG_FILE", str(cfg_path))
+    monkeypatch.delitem(sys.modules, "main_service", raising=False)
+    import importlib
+
+    svc.handlers_before_import = list(logging.getLogger("main_service").handlers)
+    module = importlib.import_module("main_service")
+    yield module, svc
+    sys.modules.pop("main_service", None)
+
+
+def test_import_does_not_start_the_service(ms_module, tmp_path):
+    module, svc = ms_module
+    assert svc.client is None and svc.calls == []  # no MQTT client, no Neo4j session
+    assert not (tmp_path / "logs").exists()  # no log folder / kpi_log / app log
+    assert module.pipeline is None
+    assert logging.getLogger("main_service").handlers == svc.handlers_before_import  # no logger setup
+    assert callable(module.main)
+
+
+SNAPSHOT = {
+    "observation_time_sec": 120.0,
+    "system": {"num_completions": 4, "num_scraps": 1, "wip_instantaneous": 3, "wip_average": 2.5,
+               "complete_rate": 0.0333, "scrap_rate": 0.2, "avg_cycle_time_fin": 41.25,
+               "avg_cycle_time_all": 40.0},
+    "stages": {
+        "stage10": {"wip_instantaneous": 0, "wip_average": 0.0, "num_departures": 0, "throughput": 0.0,
+                    "avg_flow_time": 0.0},
+        "stage2": {"instantaneous_wip": 2, "avg_wip": 1.25, "departures": 7, "throughput_per_sec": 0.05,
+                   "avg_flow_time_sec": 9.5},
+        "stage1": {"wip_instantaneous": 1, "wip_average": 0.5, "num_departures": 9, "throughput": 0.075,
+                   "avg_flow_time": 6.0},
+    },
+    "state_probability": {"station11": {"busy": 0.5, "fail": 0.1, "blocked": 0.15, "idle": 0.25},
+                          "station21": {"loading": 0.25, "idle": 0.75}},
+    "utilization": {"station11": 0.5},
+}
+
+
+def test_summary_lines_read_system_block_and_order_stages_numerically(ms_module):
+    module, _ = ms_module
+    assert module.format_kpi_summary_lines(SNAPSHOT) == [
+        "[KPI system] NumCompletions=4 NumScraps=1 WIP=3 AvgWIP=2.500 CompleteRate=0.0333/s "
+        "ScrapRate=0.200 AvgCycleFin=41.2s AvgCycleAll=40.0s obs_time=120.0s",
+        "[KPI stage 1] WIP=1 AvgWIP=0.500 NumDepartures=9 Throughput=0.0750/s AvgFlow=6.0s",
+        "[KPI stage 2] WIP=2 AvgWIP=1.250 NumDepartures=7 Throughput=0.0500/s AvgFlow=9.5s",  # older stage keys
+        "[KPI stage 10] WIP=0 AvgWIP=0.000 NumDepartures=0 Throughput=0.0000/s AvgFlow=0.0s",
+    ]
+
+
+def test_summary_lines_fall_back_to_top_level_keys(ms_module):
+    module, _ = ms_module
+    legacy = {"observation_time_sec": 60, "throughput": 0.05, "finished_count": 3, "scrap_count": 1,
+              "scrap_rate": 0.25, "avg_flow_time_sec": 30, "avg_cycle_time_all_sec": 28.5, "current_wip": 2,
+              "avg_wip": 1.5}
+    assert module.format_kpi_summary_lines(legacy) == [
+        "[KPI system] NumCompletions=3 NumScraps=1 WIP=2 AvgWIP=1.500 CompleteRate=0.0500/s "
+        "ScrapRate=0.250 AvgCycleFin=30.0s AvgCycleAll=28.5s obs_time=60.0s",
+    ]
+    with pytest.raises(KeyError, match="observation_time_sec"):
+        module.format_kpi_summary_lines({"system": {}})
+
+
+def test_station_lines(ms_module):
+    module, _ = ms_module
+    assert module.format_station_state_lines(SNAPSHOT) == [
+        "  station11",
+        "    Utilization (P_busy): 0.50",
+        "    P_busy: 0.50  P_fail: 0.10  P_blocked: 0.15  P_idle: 0.25",
+        "  station21",
+        "    Utilization (P_busy): 0.00",  # not in utilization -> 0
+        "    P_busy: 0.25  P_fail: 0.00  P_blocked: 0.00  P_idle: 0.75",  # 'loading' counts as busy
+    ]
+    assert module.format_station_state_lines({}) == []
+    with pytest.raises(KeyError, match="utilization"):
+        module.format_station_state_lines({"state_probability": {"station11": {}}})
