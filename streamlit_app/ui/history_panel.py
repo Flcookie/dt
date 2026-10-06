@@ -305,6 +305,16 @@ def _clear_history_caches() -> None:
     _cached_export_kpi_csv.clear()
 
 
+_SPEED_PRESETS = {
+    "1×": 1.0,
+    "2×": 2.0,
+    "5×": 5.0,
+    "10×": 10.0,
+    "20×": 20.0,
+    "50×": 50.0,
+}
+
+
 def render_history_panel(*, key_prefix: str = "hist", disabled: bool = False) -> None:
     """All widget keys are prefixed to avoid clashes when embedded.
 
@@ -313,84 +323,122 @@ def render_history_panel(*, key_prefix: str = "hist", disabled: bool = False) ->
     """
     kp = key_prefix
     d = disabled
+    sess_key = "{}_history_session_id".format(kp)
+    export_sid_key = "{}_export_session_id".format(kp)
+    dup_key = "{}_dup_import".format(kp)
+    feedback_key = _import_feedback_key(kp)
+
     if d:
-        _dup_k = "{}_dup_import".format(kp)
-        if _dup_k in st.session_state:
-            del st.session_state[_dup_k]
-        st.session_state.pop(_import_feedback_key(kp), None)
+        st.session_state.pop(dup_key, None)
+        st.session_state.pop(feedback_key, None)
     ui_replay_panel.ensure_replay_session_state()
 
     st.markdown(_history_panel_css(kp), unsafe_allow_html=True)
 
-    _sess_key = "{}_history_session_id".format(kp)
-    sel_ids: list[str] = []
-    id_to_label: dict[str, str] = {}
-
-    if d:
-        st.session_state[_sess_key] = _HIST_SESSION_PLACEHOLDER
-    else:
-        status = neo4j_backend.neo4j_ping()
-        if not status.get("connected"):
-            st.error(
-                "Database not connected: **{}**".format(status.get("error", "unknown"))
-            )
-            st.session_state[_sess_key] = _HIST_SESSION_PLACEHOLDER
-        else:
-            _pend = st.session_state.pop("{}_pending_select_session".format(kp), None)
-            sessions = _cached_sessions_enriched(120)
-            # Hide empty+open artifacts (typically aborted/placeholder sessions) from History selector.
-            sessions = [
-                s
-                for s in sessions
-                if not (
-                    int(s.get("event_count") or 0) <= 0
-                    and str(s.get("status_badge") or "").strip().lower() == "open"
-                )
-            ]
-            sel_ids = [s["id"] for s in sessions]
-            id_to_label = {s["id"]: s.get("label") or s["id"] for s in sessions}
-
-            if _pend and isinstance(_pend, str) and _pend in sel_ids:
-                st.session_state[_sess_key] = _pend
-            elif not sel_ids:
-                st.session_state[_sess_key] = _HIST_SESSION_PLACEHOLDER
-            else:
-                _cur = st.session_state.get(_sess_key)
-                if isinstance(_cur, str) and (
-                    _cur in sel_ids or _cur == _HIST_SESSION_PLACEHOLDER
-                ):
-                    pass
-                else:
-                    st.session_state[_sess_key] = _HIST_SESSION_PLACEHOLDER
+    sel_ids, id_to_label = _sync_session_choices(kp, sess_key, d)
 
     _rp = st.session_state.get("replay_proc")
     if _rp is not None and _rp.poll() is not None:
         ui_replay_panel._clear_replay_child_and_temp_file()
 
-    speed_presets = {
-        "1×": 1.0,
-        "2×": 2.0,
-        "5×": 5.0,
-        "10×": 10.0,
-        "20×": 20.0,
-        "50×": 50.0,
-    }
-    _rec_on = recording.is_recording()
-    _replay_live = (
+    rec_on = recording.is_recording()
+    replay_live = (
         st.session_state.get("replay_proc") is not None
         and st.session_state.replay_proc.poll() is None
     )
 
-    _sess_options = (
-        [_HIST_SESSION_PLACEHOLDER] + sel_ids if sel_ids else [_HIST_SESSION_PLACEHOLDER]
+    chosen_id, export_sid = _render_session_select(
+        sess_key, export_sid_key, sel_ids, id_to_label, d, replay_live
     )
-    _export_sid_key = "{}_export_session_id".format(kp)
-    if not d and sel_ids:
-        _resolved_pre = _resolve_history_session_id(
-            _sess_key, _export_sid_key, sel_ids, id_to_label
+    _render_replay_export_toolbar(
+        kp,
+        d,
+        sess_key=sess_key,
+        export_sid_key=export_sid_key,
+        sel_ids=sel_ids,
+        id_to_label=id_to_label,
+        export_sid=export_sid,
+        replay_live=replay_live,
+        can_start=bool(chosen_id) and not rec_on and not replay_live and not d,
+    )
+
+    st.markdown('<hr class="hist-section-divider" />', unsafe_allow_html=True)
+
+    up, do_import = _render_import_row(kp, d, dup_key)
+    if do_import:
+        with st.spinner("Importing..."):
+            _import_uploaded_csv(up, kp, dup_key, feedback_key)
+
+    _show_import_feedback(feedback_key)
+
+    if dup_key in st.session_state:
+        _render_duplicate_import_prompt(kp, d, dup_key, feedback_key)
+
+
+def _sync_session_choices(
+    kp: str, sess_key: str, disabled: bool
+) -> tuple[list[str], dict[str, str]]:
+    """Load selectable Neo4j sessions and keep the session selectbox on a valid value.
+
+    Returns ``(session ids, id -> label)``; both empty when disabled or Neo4j is down
+    (selection forced to the placeholder). A session queued by a successful import
+    (``{kp}_pending_select_session``) is selected once.
+    """
+    if disabled:
+        st.session_state[sess_key] = _HIST_SESSION_PLACEHOLDER
+        return [], {}
+
+    status = neo4j_backend.neo4j_ping()
+    if not status.get("connected"):
+        st.error("Database not connected: **{}**".format(status.get("error", "unknown")))
+        st.session_state[sess_key] = _HIST_SESSION_PLACEHOLDER
+        return [], {}
+
+    pending = st.session_state.pop("{}_pending_select_session".format(kp), None)
+    sessions = _cached_sessions_enriched(120)
+    # Hide empty+open artifacts (typically aborted/placeholder sessions) from History selector.
+    sessions = [
+        s
+        for s in sessions
+        if not (
+            int(s.get("event_count") or 0) <= 0
+            and str(s.get("status_badge") or "").strip().lower() == "open"
         )
-        if _resolved_pre:
-            st.session_state[_sess_key] = _resolved_pre
+    ]
+    sel_ids = [s["id"] for s in sessions]
+    id_to_label = {s["id"]: s.get("label") or s["id"] for s in sessions}
+
+    if pending and isinstance(pending, str) and pending in sel_ids:
+        st.session_state[sess_key] = pending
+    elif not sel_ids:
+        st.session_state[sess_key] = _HIST_SESSION_PLACEHOLDER
+    else:
+        cur = st.session_state.get(sess_key)
+        if not (
+            isinstance(cur, str) and (cur in sel_ids or cur == _HIST_SESSION_PLACEHOLDER)
+        ):
+            st.session_state[sess_key] = _HIST_SESSION_PLACEHOLDER
+    return sel_ids, id_to_label
+
+
+def _render_session_select(
+    sess_key: str,
+    export_sid_key: str,
+    sel_ids: list[str],
+    id_to_label: dict[str, str],
+    disabled: bool,
+    replay_live: bool,
+) -> tuple[str | None, str | None]:
+    """Session selectbox. Returns ``(chosen session id, session id used for export)``.
+
+    Also publishes the choice as ``dt_resolved_session`` for the Digital Twin page.
+    """
+    if not disabled and sel_ids:
+        resolved_pre = _resolve_history_session_id(
+            sess_key, export_sid_key, sel_ids, id_to_label
+        )
+        if resolved_pre:
+            st.session_state[sess_key] = resolved_pre
 
     def _format_session_option(sid: str) -> str:
         if sid == _HIST_SESSION_PLACEHOLDER:
@@ -399,35 +447,46 @@ def render_history_panel(*, key_prefix: str = "hist", disabled: bool = False) ->
 
     st.selectbox(
         "session",
-        _sess_options,
+        [_HIST_SESSION_PLACEHOLDER] + sel_ids,
         format_func=_format_session_option,
-        key=_sess_key,
+        key=sess_key,
         label_visibility="collapsed",
-        disabled=d or _replay_live or not sel_ids,
+        disabled=disabled or replay_live or not sel_ids,
         help="Choose a Neo4j session for replay and export.",
     )
 
-    _raw_sel = st.session_state.get(_sess_key)
-    chosen_id: str | None = _resolve_history_session_id(
-        _sess_key, _export_sid_key, sel_ids, id_to_label
-    )
-    if isinstance(_raw_sel, str) and _raw_sel == _HIST_SESSION_PLACEHOLDER:
-        st.session_state.pop(_export_sid_key, None)
+    raw_sel = st.session_state.get(sess_key)
+    chosen_id = _resolve_history_session_id(sess_key, export_sid_key, sel_ids, id_to_label)
+    if isinstance(raw_sel, str) and raw_sel == _HIST_SESSION_PLACEHOLDER:
+        st.session_state.pop(export_sid_key, None)
     elif chosen_id:
-        st.session_state[_export_sid_key] = chosen_id
+        st.session_state[export_sid_key] = chosen_id
 
-    export_sid: str | None = st.session_state.get(_export_sid_key) if not d else None
-    if not d:
+    export_sid: str | None = st.session_state.get(export_sid_key) if not disabled else None
+    if not disabled:
         st.session_state["dt_resolved_session"] = chosen_id or export_sid
+    return chosen_id, export_sid
 
-    _exp_disabled = d or not export_sid
+
+def _render_replay_export_toolbar(
+    kp: str,
+    disabled: bool,
+    *,
+    sess_key: str,
+    export_sid_key: str,
+    sel_ids: list[str],
+    id_to_label: dict[str, str],
+    export_sid: str | None,
+    replay_live: bool,
+    can_start: bool,
+) -> None:
+    """Speed · Start/Stop Replay · Export Event Log · Export KPI Report."""
     ev_csv = b""
     kpi_csv = b""
     if export_sid:
         ev_csv = _cached_export_events_csv(export_sid)
         kpi_csv = _cached_export_kpi_csv(export_sid)
-
-    _can_start = bool(chosen_id) and not _rec_on and not _replay_live and not d
+    export_disabled = disabled or not export_sid
 
     with st.container(key="{}_hist_toolbar".format(kp)):
         c_speed, c2, c3, c4 = st.columns(
@@ -438,75 +497,38 @@ def render_history_panel(*, key_prefix: str = "hist", disabled: bool = False) ->
         with c_speed:
             sp_label = st.selectbox(
                 "Speed",
-                list(speed_presets.keys()),
+                list(_SPEED_PRESETS.keys()),
                 index=3,
                 key="{}_replay_spd".format(kp),
                 label_visibility="collapsed",
-                disabled=d or _replay_live,
+                disabled=disabled or replay_live,
                 help="Playback speed (before Start Replay)",
             )
-        speed = speed_presets[sp_label]
+        speed = _SPEED_PRESETS[sp_label]
         with c2:
-            if _replay_live:
+            if replay_live:
                 if st.button(
                     "Stop Replay",
                     key="{}_replay_toggle".format(kp),
-                    disabled=d,
+                    disabled=disabled,
                     use_container_width=True,
                 ):
                     ui_replay_panel._clear_replay_child_and_temp_file()
                     st.rerun()
-            else:
-                if st.button(
-                    "Start Replay",
-                    key="{}_replay_toggle".format(kp),
-                    disabled=not _can_start,
-                    use_container_width=True,
-                ):
-                    replay_sid = _resolve_history_session_id(
-                        _sess_key, _export_sid_key, sel_ids, id_to_label
-                    )
-                    if not replay_sid:
-                        st.error("Choose a session first.")
-                    else:
-                        st.session_state[_export_sid_key] = replay_sid
-                        n_events = neo4j_backend.count_session_events(replay_sid)
-                        if n_events < 0:
-                            st.error(
-                                "Could not read events from the database. "
-                                "Check Neo4j connection and try again."
-                            )
-                        elif n_events <= 0:
-                            st.error("No events in this session.")
-                        else:
-                            ui_replay_panel._clear_replay_child_and_temp_file()
-                            _ok_ms, _ms_msg = process_control.ensure_main_service_replay()
-                            if not _ok_ms:
-                                st.error(_ms_msg)
-                            else:
-                                _abort = False
-                                _local = os.path.normpath(
-                                    os.path.join(PROJECT_ROOT, "config_local.json")
-                                )
-                                if os.path.isfile(_local):
-                                    try:
-                                        mqtt_backend.switch_config_file("config_local.json")
-                                        time.sleep(2)
-                                    except Exception as e:
-                                        st.error(
-                                            "Failed to switch local config: {}".format(e)
-                                        )
-                                        _abort = True
-                                if not _abort:
-                                    ui_replay_panel._reset_replay_downstream_for_new_run()
-                                    try:
-                                        st.session_state.replay_proc = (
-                                            mqtt_backend.run_replay_session_subprocess(
-                                                replay_sid, speed
-                                            )
-                                        )
-                                    except Exception as ex:
-                                        st.error(str(ex))
+            elif st.button(
+                "Start Replay",
+                key="{}_replay_toggle".format(kp),
+                disabled=not can_start,
+                use_container_width=True,
+            ):
+                replay_sid = _resolve_history_session_id(
+                    sess_key, export_sid_key, sel_ids, id_to_label
+                )
+                if not replay_sid:
+                    st.error("Choose a session first.")
+                else:
+                    st.session_state[export_sid_key] = replay_sid
+                    _start_session_replay(replay_sid, speed)
             _rp_show = st.session_state.get("replay_proc")
             if _rp_show is not None and _rp_show.poll() is None:
                 st.markdown(
@@ -527,7 +549,7 @@ def render_history_panel(*, key_prefix: str = "hist", disabled: bool = False) ->
                 key="{}_dl_log".format(kp),
                 use_container_width=True,
                 help="Events: time, component_id, part_id, activity",
-                disabled=_exp_disabled,
+                disabled=export_disabled,
             )
         with c4:
             st.download_button(
@@ -538,15 +560,55 @@ def render_history_panel(*, key_prefix: str = "hist", disabled: bool = False) ->
                 key="{}_dl_kpi".format(kp),
                 use_container_width=True,
                 help="KPI long table: system / stage / station",
-                disabled=_exp_disabled,
+                disabled=export_disabled,
             )
 
-    st.markdown('<hr class="hist-section-divider" />', unsafe_allow_html=True)
 
-    dup_key = "{}_dup_import".format(kp)
-    _ifb = _import_feedback_key(kp)
-    _dup_wait = dup_key in st.session_state
-    do_import = False
+def _start_session_replay(replay_sid: str, speed: float) -> None:
+    """Start the KPI-only replay worker for an existing Neo4j session.
+
+    Order: check the session has events -> stop any previous replay -> stop main_service
+    -> switch to ``config_local.json`` if it exists -> clear KPI caches -> spawn worker.
+    Any failure is shown with ``st.error`` and stops the sequence.
+    """
+    n_events = neo4j_backend.count_session_events(replay_sid)
+    if n_events < 0:
+        st.error(
+            "Could not read events from the database. "
+            "Check Neo4j connection and try again."
+        )
+        return
+    if n_events <= 0:
+        st.error("No events in this session.")
+        return
+
+    ui_replay_panel._clear_replay_child_and_temp_file()
+    ok_ms, ms_msg = process_control.ensure_main_service_replay()
+    if not ok_ms:
+        st.error(ms_msg)
+        return
+
+    local_cfg = os.path.normpath(os.path.join(PROJECT_ROOT, "config_local.json"))
+    if os.path.isfile(local_cfg):
+        try:
+            mqtt_backend.switch_config_file("config_local.json")
+            time.sleep(2)
+        except Exception as e:
+            st.error("Failed to switch local config: {}".format(e))
+            return
+
+    ui_replay_panel._reset_replay_downstream_for_new_run()
+    try:
+        st.session_state.replay_proc = mqtt_backend.run_replay_session_subprocess(
+            replay_sid, speed
+        )
+    except Exception as ex:
+        st.error(str(ex))
+
+
+def _render_import_row(kp: str, disabled: bool, dup_key: str):
+    """CSV uploader + "Import to Database" button. Returns ``(uploaded file, clicked)``."""
+    dup_wait = dup_key in st.session_state
     with st.container(key="{}_import_block".format(kp)):
         _imp_l, _imp_r = st.columns(
             [3, 1], gap="small", vertical_alignment="center"
@@ -557,166 +619,157 @@ def render_history_panel(*, key_prefix: str = "hist", disabled: bool = False) ->
                 type=["csv"],
                 key="{}_csv_up".format(kp),
                 label_visibility="collapsed",
-                disabled=d,
+                disabled=disabled,
             )
         with _imp_r:
             with st.container(key="{}_import_col".format(kp)):
-                if _dup_wait:
+                if dup_wait:
                     st.caption("Duplicate session — see options below.")
                 do_import = st.button(
                     "Import to Database",
                     key="{}_import_btn".format(kp),
                     use_container_width=True,
-                    disabled=d or _dup_wait or up is None,
+                    disabled=disabled or dup_wait or up is None,
                 )
+    return up, do_import
 
-    if do_import:
-        with st.spinner("Importing..."):
-            st.session_state.pop(_ifb, None)
-            if not up:
-                st.session_state[_ifb] = {
-                    "level": "error",
-                    "text": "Import failed. Choose a CSV file first.",
-                }
-            else:
-                rows = []
-                try:
-                    text = io.TextIOWrapper(up, encoding="utf-8", errors="replace")
-                    rows = list(csv.DictReader(text))
-                except Exception as ex:
-                    st.session_state[_ifb] = {
-                        "level": "error",
-                        "text": "Import failed. {}".format(ex),
-                    }
-                    rows = []
-                if not rows and not st.session_state.get(_ifb):
-                    st.session_state[_ifb] = {
-                        "level": "error",
-                        "text": "Import failed. The file has no data rows.",
-                    }
-                elif rows:
-                    missing = [
-                        r
-                        for r in rows
-                        if not str(r.get("time") or "").strip()
-                        or "activity" not in r
-                        or "component_id" not in r
-                    ]
-                    if missing:
-                        st.session_state[_ifb] = {
-                            "level": "error",
-                            "text": (
-                                "Import failed. Each row must include time, component_id, "
-                                "part_id, and activity."
-                            ),
-                        }
-                    else:
-                        sorted_rows = sorted(
-                            rows,
-                            key=lambda r: neo4j_backend._parse_event_time_key(
-                                r.get("time")
-                            ),
-                        )
-                        first_raw = str(sorted_rows[0].get("time") or "").strip()
-                        n = len(sorted_rows)
-                        dup_info = neo4j_backend.find_csv_import_duplicate_info(
-                            first_raw, n
-                        )
-                        if dup_info:
-                            st.session_state.pop(_ifb, None)
-                            st.session_state[dup_key] = {
-                                "rows": sorted_rows,
-                                "filename": up.name or "uploaded.csv",
-                                "dup_info": dup_info,
-                            }
-                            st.rerun()
-                        else:
-                            try:
-                                _sid, n_ev, _ = neo4j_backend.import_csv_session(
-                                    sorted_rows,
-                                    up.name or "uploaded.csv",
-                                    force_new_id=False,
-                                    display_name=None,
-                                )
-                                st.session_state[
-                                    "{}_pending_select_session".format(kp)
-                                ] = _sid
-                                st.session_state[_ifb] = {
-                                    "level": "success",
-                                    "text": "Import successful. {} event(s) imported.".format(
-                                        n_ev
-                                    ),
-                                }
-                                _clear_history_caches()
-                                st.rerun()
-                            except Exception as ex:
-                                st.session_state[_ifb] = {
-                                    "level": "error",
-                                    "text": "Import failed. {}".format(ex),
-                                }
 
-    _fbv = st.session_state.get(_ifb)
-    if isinstance(_fbv, dict) and str(_fbv.get("text") or "").strip():
-        _lvl = str(_fbv.get("level") or "info")
-        _ft = str(_fbv["text"])
-        if _lvl == "success":
-            st.success(_ft, icon="✅")
-        elif _lvl == "error":
-            st.error(_ft, icon="❌")
-        else:
-            st.info(_ft, icon="ℹ️")
+def _import_uploaded_csv(up, kp: str, dup_key: str, feedback_key: str) -> None:
+    """Validate the uploaded CSV and import it as a new session.
 
-    if dup_key in st.session_state:
-        payload = st.session_state[dup_key]
-        di = payload.get("dup_info") or {}
-        n = len(payload.get("rows") or [])
-        st.warning(
-            "This dataset already exists as session **`{}`** "
-            "(same first event time and **{}** rows). "
-            "Session start_time: `{}`.".format(
-                di.get("id", "—"),
-                n,
-                di.get("start_time") or "—",
-            )
+    If a session with the same first event time and row count exists, park the rows
+    under ``dup_key`` (the duplicate prompt asks the user) instead of importing.
+    Results are reported through ``feedback_key``.
+    """
+    st.session_state.pop(feedback_key, None)
+    if not up:
+        _set_import_feedback(feedback_key, "error", "Import failed. Choose a CSV file first.")
+        return
+
+    try:
+        text = io.TextIOWrapper(up, encoding="utf-8", errors="replace")
+        rows = list(csv.DictReader(text))
+    except Exception as ex:
+        _set_import_feedback(feedback_key, "error", "Import failed. {}".format(ex))
+        return
+    if not rows:
+        _set_import_feedback(feedback_key, "error", "Import failed. The file has no data rows.")
+        return
+
+    missing = [
+        r
+        for r in rows
+        if not str(r.get("time") or "").strip()
+        or "activity" not in r
+        or "component_id" not in r
+    ]
+    if missing:
+        _set_import_feedback(
+            feedback_key,
+            "error",
+            "Import failed. Each row must include time, component_id, part_id, and activity.",
         )
-        b1, b2 = st.columns(2)
-        if b1.button(
-            "Skip",
-            key="{}_dup_skip".format(kp),
-            use_container_width=True,
-            disabled=d,
-        ):
-            del st.session_state[dup_key]
-            st.session_state.pop(_ifb, None)
-            st.rerun()
-        if b2.button(
-            "Import as new session anyway",
-            key="{}_dup_force".format(kp),
-            use_container_width=True,
-            disabled=d,
-        ):
-            p = st.session_state.pop(dup_key, None)
-            if p:
-                with st.spinner("Importing..."):
-                    try:
-                        _sid, n_ev, _ = neo4j_backend.import_csv_session(
-                            p["rows"],
-                            p["filename"],
-                            force_new_id=True,
-                            display_name=None,
-                        )
-                        st.session_state["{}_pending_select_session".format(kp)] = _sid
-                        st.session_state[_ifb] = {
-                            "level": "success",
-                            "text": "Import successful. {} event(s) imported.".format(
-                                n_ev
-                            ),
-                        }
-                        _clear_history_caches()
-                        st.rerun()
-                    except Exception as ex:
-                        st.session_state[_ifb] = {
-                            "level": "error",
-                            "text": "Import failed. {}".format(ex),
-                        }
-                        st.rerun()
+        return
+
+    sorted_rows = sorted(
+        rows,
+        key=lambda r: neo4j_backend._parse_event_time_key(r.get("time")),
+    )
+    first_raw = str(sorted_rows[0].get("time") or "").strip()
+    dup_info = neo4j_backend.find_csv_import_duplicate_info(first_raw, len(sorted_rows))
+    if dup_info:
+        st.session_state.pop(feedback_key, None)
+        st.session_state[dup_key] = {
+            "rows": sorted_rows,
+            "filename": up.name or "uploaded.csv",
+            "dup_info": dup_info,
+        }
+        st.rerun()
+    else:
+        _import_rows_as_session(
+            sorted_rows, up.name or "uploaded.csv", kp, feedback_key, force_new_id=False
+        )
+
+
+def _import_rows_as_session(
+    rows: list[dict], filename: str, kp: str, feedback_key: str, *, force_new_id: bool
+) -> None:
+    """Import rows into Neo4j. On success: select the new session, report, clear caches, rerun.
+
+    On failure only the error feedback is set (callers decide whether to rerun).
+    """
+    try:
+        _sid, n_ev, _ = neo4j_backend.import_csv_session(
+            rows,
+            filename,
+            force_new_id=force_new_id,
+            display_name=None,
+        )
+        st.session_state["{}_pending_select_session".format(kp)] = _sid
+        _set_import_feedback(
+            feedback_key, "success", "Import successful. {} event(s) imported.".format(n_ev)
+        )
+        _clear_history_caches()
+        st.rerun()
+    except Exception as ex:
+        _set_import_feedback(feedback_key, "error", "Import failed. {}".format(ex))
+
+
+def _set_import_feedback(feedback_key: str, level: str, text: str) -> None:
+    st.session_state[feedback_key] = {"level": level, "text": text}
+
+
+def _show_import_feedback(feedback_key: str) -> None:
+    fb = st.session_state.get(feedback_key)
+    if not (isinstance(fb, dict) and str(fb.get("text") or "").strip()):
+        return
+    level = str(fb.get("level") or "info")
+    text = str(fb["text"])
+    if level == "success":
+        st.success(text, icon="✅")
+    elif level == "error":
+        st.error(text, icon="❌")
+    else:
+        st.info(text, icon="ℹ️")
+
+
+def _render_duplicate_import_prompt(
+    kp: str, disabled: bool, dup_key: str, feedback_key: str
+) -> None:
+    """Warning + "Skip" / "Import as new session anyway" for a parked duplicate CSV import."""
+    payload = st.session_state[dup_key]
+    di = payload.get("dup_info") or {}
+    n = len(payload.get("rows") or [])
+    st.warning(
+        "This dataset already exists as session **`{}`** "
+        "(same first event time and **{}** rows). "
+        "Session start_time: `{}`.".format(
+            di.get("id", "—"),
+            n,
+            di.get("start_time") or "—",
+        )
+    )
+    b1, b2 = st.columns(2)
+    if b1.button(
+        "Skip",
+        key="{}_dup_skip".format(kp),
+        use_container_width=True,
+        disabled=disabled,
+    ):
+        del st.session_state[dup_key]
+        st.session_state.pop(feedback_key, None)
+        st.rerun()
+    if b2.button(
+        "Import as new session anyway",
+        key="{}_dup_force".format(kp),
+        use_container_width=True,
+        disabled=disabled,
+    ):
+        p = st.session_state.pop(dup_key, None)
+        if p:
+            with st.spinner("Importing..."):
+                _import_rows_as_session(
+                    p["rows"], p["filename"], kp, feedback_key, force_new_id=True
+                )
+                # Reached only when the import failed (success already reran).
+                st.rerun()
