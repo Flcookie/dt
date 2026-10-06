@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html as html_module
 import time
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -682,18 +683,31 @@ def render_part_trace_panel(
     twin_preloaded_rows: list[dict] | None = None,
     twin_preloaded_session_id: str | None = None,
 ) -> None:
-    bootstrap_part_trace_session_state(from_query_params=from_query_params)
-    force_all_parts = use_page_session
+    """Part Trace view.
 
-    if not force_all_parts:
+    Standalone page (default): session / part pickers, then either the session overview
+    (empty Part ID) or one part's detail and paged events.
+    Embedded in Digital Twin (``use_page_session=True``): no pickers, Process level, and only
+    the session flow-conformance table.
+
+    ``twin_preloaded_session_id`` is accepted for call-site compatibility and not used.
+    """
+    _ = twin_preloaded_session_id
+    bootstrap_part_trace_session_state(from_query_params=from_query_params)
+    embedded = use_page_session
+
+    if embedded:
+        event_level = "Process level"
+        picked_session_id = _embedded_session_id(
+            use_coordinated_twin_session, coordinated_twin_session_id
+        )
+        part_id = ""
+        page_size = 10
+    else:
         st.caption(
             "**Flow & Rework** follow **mainline process stages** (fixed model). **Physical loops** "
             "(return belt / splitter / corner) are transport-only unless they coincide with **stage rollback**."
         )
-
-    if force_all_parts:
-        event_level = "Process level"
-    else:
         event_level = st.radio(
             "Detail",
             ["Process level", "All events"],
@@ -701,38 +715,7 @@ def render_part_trace_panel(
             index=0,
             key="pt_event_level",
         )
-
-    if force_all_parts:
-        if use_coordinated_twin_session:
-            picked_session_id = coordinated_twin_session_id
-        else:
-            if st.session_state.get("cp_data_source") == "live":
-                picked_session_id = mqtt_backend.physical_kpi_session_id()
-            else:
-                _rps = mqtt_backend.get_replay_pipeline_session_id()
-                picked_session_id = _rps or st.session_state.get(
-                    "dt_resolved_session"
-                )
-    else:
-        sessions = neo4j_backend.list_recent_sessions(40)
-        opts = [("Latest session (by start_time)", None)]
-        for s in sessions:
-            sid = s.get("id") or ""
-            desc = (s.get("description") or "").strip()
-            label = sid[:12] + ("..." if len(sid) > 12 else "")
-            if desc:
-                label = "{} · {}".format(label, desc[:24])
-            opts.append((label, sid or None))
-
-        ix = st.selectbox(
-            "Session",
-            range(len(opts)),
-            format_func=lambda i: opts[i][0],
-            key="trace_session_ix",
-        )
-        picked_session_id = opts[ix][1]
-
-    if not force_all_parts:
+        picked_session_id = _pick_trace_session_id()
         part_id = st.text_input(
             "Part ID (empty = session summary)",
             key="part_trace_part_id",
@@ -740,223 +723,257 @@ def render_part_trace_panel(
         page_size = st.selectbox(
             "Steps per page", [10, 25, 50], index=0, key="pt_page_size"
         )
-    else:
-        part_id = ""
-        page_size = 10
 
     if "trace_page" not in st.session_state:
         st.session_state.trace_page = 0
 
-    if not force_all_parts and st.button("Query", key="pt_query_btn"):
+    if not embedded and st.button("Query", key="pt_query_btn"):
         st.session_state.trace_page = 0
 
-    flow_key = None if force_all_parts else (part_id.strip() or None)
-    _k = kpi_for_replay
-    if _k is None:
-        _k, _ = mqtt_backend.get_kpi_snapshot()
+    kpi = kpi_for_replay
+    if kpi is None:
+        kpi, _ = mqtt_backend.get_kpi_snapshot()
 
-    _use_twin_preload = (
-        use_page_session
+    use_twin_preload = (
+        embedded
         and use_coordinated_twin_session
-        and force_all_parts
-        and (
-            twin_preloaded_parts is not None
-            or twin_preloaded_rows is not None
-        )
+        and (twin_preloaded_parts is not None or twin_preloaded_rows is not None)
     )
-    if _use_twin_preload:
+    if use_twin_preload:
+        # Rows without parts are not supported: list(None) raises here.
         parts = list(twin_preloaded_parts)
-        data = {
-            "parts": parts,
-            "session_id": twin_preloaded_session_id or picked_session_id,
-            "error": None,
-        }
-        err = data.get("error")
     else:
-        data = neo4j_backend.query_part_flow(flow_key, picked_session_id)
-        err = data.get("error")
-        if err and not use_page_session:
-            st.warning(err)
-        if not force_all_parts:
-            st.text(data.get("session_id") or "-")
-        parts = data.get("parts") or []
-        parts = part_track_conformance.filter_parts_to_replay_kpi_progress(
-            parts, _k
-        )
+        flow_key = None if embedded else (part_id.strip() or None)
+        parts = _query_trace_parts(flow_key, picked_session_id, kpi, embedded=embedded)
+
+    if embedded:
+        _render_twin_flow_table(parts, twin_preloaded_rows)
+    elif not part_id.strip():
+        _render_session_overview(parts, event_level)
+    elif len(parts) == 1:
+        _render_single_part(parts[0], event_level, page_size)
+    else:
+        _render_part_not_found()
+
+
+def _embedded_session_id(
+    use_coordinated_twin_session: bool, coordinated_twin_session_id: str | None
+) -> str | None:
+    """Session for the embedded view: the twin's session, else the active KPI source's."""
+    if use_coordinated_twin_session:
+        return coordinated_twin_session_id
+    if st.session_state.get("cp_data_source") == "live":
+        return mqtt_backend.physical_kpi_session_id()
+    return mqtt_backend.get_replay_pipeline_session_id() or st.session_state.get(
+        "dt_resolved_session"
+    )
+
+
+def _pick_trace_session_id() -> str | None:
+    """"Session" selectbox; the first option (None) means the latest session."""
+    sessions = neo4j_backend.list_recent_sessions(40)
+    opts = [("Latest session (by start_time)", None)]
+    for s in sessions:
+        sid = s.get("id") or ""
+        desc = (s.get("description") or "").strip()
+        label = sid[:12] + ("..." if len(sid) > 12 else "")
+        if desc:
+            label = "{} · {}".format(label, desc[:24])
+        opts.append((label, sid or None))
+
+    ix = st.selectbox(
+        "Session",
+        range(len(opts)),
+        format_func=lambda i: opts[i][0],
+        key="trace_session_ix",
+    )
+    return opts[ix][1]
+
+
+def _query_trace_parts(
+    flow_key: str | None, session_id: str | None, kpi: Any, *, embedded: bool
+) -> list[dict]:
+    """Parts (with steps) from Neo4j, trimmed to the replay's progress when replaying.
+
+    The standalone page also shows the query error and the resolved session id.
+    """
+    data = neo4j_backend.query_part_flow(flow_key, session_id)
+    err = data.get("error")
+    if err and not embedded:
+        st.warning(err)
+    if not embedded:
+        st.text(data.get("session_id") or "-")
+    parts = data.get("parts") or []
+    return part_track_conformance.filter_parts_to_replay_kpi_progress(parts, kpi)
+
+
+def _render_twin_flow_table(parts: list[dict], preloaded_rows: list[dict] | None) -> None:
+    """Digital Twin embed: flow-conformance table; rows are kept for the trace dialog."""
+    if preloaded_rows is not None:
+        rows_pt = preloaded_rows
+    else:
+        rows_pt = part_track_conformance.build_session_table_rows(parts)
+    if rows_pt:
+        _twin_flow_maybe_open_trace_from_query(rows_pt)
+        render_digital_twin_flow_conformance_table(rows_pt)
+        st.session_state[_DT_TRACE_ROWS_SESSION_KEY] = rows_pt
+    else:
+        st.session_state.pop(_DT_TRACE_ROWS_SESSION_KEY, None)
+        render_digital_twin_flow_conformance_table([])
+
+
+def _render_session_overview(parts: list[dict], event_level: str) -> None:
+    """All parts of the session: overview table, process paths, part detail picker, stage matrix."""
+    st.caption(
+        "Each row = **current lap** (FINISH-delimited). "
+        "**Status** summarizes quality for this lap; expand **Part detail** for per-lap breakdown and events."
+    )
     pref = twin_layout.LOGGED_COMPONENT_IDS
-    show_summary = force_all_parts or not part_id.strip()
-
-    if show_summary:
-        if use_page_session:
-            if twin_preloaded_rows is not None:
-                rows_pt = twin_preloaded_rows
-            else:
-                rows_pt = part_track_conformance.build_session_table_rows(parts)
-            if rows_pt:
-                _twin_flow_maybe_open_trace_from_query(rows_pt)
-                render_digital_twin_flow_conformance_table(rows_pt)
-                st.session_state[_DT_TRACE_ROWS_SESSION_KEY] = rows_pt
-            else:
-                st.session_state.pop(_DT_TRACE_ROWS_SESSION_KEY, None)
-                render_digital_twin_flow_conformance_table([])
-            return
-
-        if not force_all_parts:
-            st.caption(
-                "Each row = **current lap** (FINISH-delimited). "
-                "**Status** summarizes quality for this lap; expand **Part detail** for per-lap breakdown and events."
-            )
-        overview_rows: list[dict] = []
-        path_rows: list[dict] = []
-        payload: list[tuple[str, list[dict], str]] = []
-        by_pid: dict[str, tuple[list[dict], list[dict], dict]] = {}
-        for p in parts:
-            raw_steps = list(p.get("steps") or [])
-            steps = _filter_steps_for_level(raw_steps, event_level)
-            info = flow_classification.classify_flow_from_steps(raw_steps)
-            short_label = _flow_matrix_label(info)
-            pid = str(p.get("part_id") or "")
-            overview_rows.append(
-                part_track_model.build_part_overview_row_mvp(
-                    pid,
-                    steps,
-                    info,
-                    preferred_stations=pref,
-                    lifecycle_steps=raw_steps,
-                )
-            )
-            path_rows.append(
-                part_track_model.build_mvp_path_expander_row(
-                    pid,
-                    steps,
-                    info,
-                    lifecycle_steps=raw_steps,
-                )
-            )
-            payload.append((pid, steps, short_label))
-            by_pid[pid] = (steps, raw_steps, info)
-
-        col_cfg = _part_track_mvp_column_config()
-
-        st.markdown("##### Part overview")
-
-        def _block_overview_and_detail() -> None:
-            if overview_rows:
-                st.dataframe(
-                    overview_rows,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config=col_cfg,
-                )
-            else:
-                st.dataframe(
-                    pd.DataFrame(columns=list(col_cfg.keys())),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config=col_cfg,
-                )
-            _mvp_process_paths_expander(path_rows)
-            detail_opts = ["—"] + sorted(by_pid.keys())
-            pick = st.selectbox(
-                "Part detail",
-                detail_opts,
-                key="pt_detail_pick",
-            )
-            if pick and pick != "—":
-                stp, rwa, inf = by_pid[pick]
-                _render_part_detail_block(
-                    part_id=pick,
-                    steps=stp,
-                    info=inf,
-                    raw_steps=rwa,
-                )
-
-        def _block_matrix() -> None:
-            st.markdown("##### All parts · stage matrix")
-            _render_station_matrix(title="", parts_payload=payload)
-
-        _block_overview_and_detail()
-        with st.expander("Stage matrix (same data as Progress column)", expanded=False):
-            _block_matrix()
-        return
-
-    if len(parts) == 1:
-        p = parts[0]
+    overview_rows: list[dict] = []
+    path_rows: list[dict] = []
+    matrix_payload: list[tuple[str, list[dict], str]] = []
+    by_pid: dict[str, tuple[list[dict], list[dict], dict]] = {}
+    for p in parts:
         raw_steps = list(p.get("steps") or [])
         steps = _filter_steps_for_level(raw_steps, event_level)
         info = flow_classification.classify_flow_from_steps(raw_steps)
         pid = str(p.get("part_id") or "")
-        st.markdown("##### Overview")
-        st.dataframe(
-            [
-                part_track_model.build_part_overview_row(
-                    pid,
-                    steps,
-                    info,
-                    preferred_stations=pref,
-                    lifecycle_steps=raw_steps,
-                )
-            ],
-            use_container_width=True,
-            hide_index=True,
-            column_config=_part_track_overview_column_config(
-                slim_overview=False
-            ),
+        overview_rows.append(
+            part_track_model.build_part_overview_row_mvp(
+                pid,
+                steps,
+                info,
+                preferred_stations=pref,
+                lifecycle_steps=raw_steps,
+            )
         )
+        path_rows.append(
+            part_track_model.build_mvp_path_expander_row(
+                pid,
+                steps,
+                info,
+                lifecycle_steps=raw_steps,
+            )
+        )
+        matrix_payload.append((pid, steps, _flow_matrix_label(info)))
+        by_pid[pid] = (steps, raw_steps, info)
+
+    col_cfg = _part_track_mvp_column_config()
+
+    st.markdown("##### Part overview")
+    st.dataframe(
+        overview_rows if overview_rows else pd.DataFrame(columns=list(col_cfg.keys())),
+        use_container_width=True,
+        hide_index=True,
+        column_config=col_cfg,
+    )
+    _mvp_process_paths_expander(path_rows)
+    pick = st.selectbox(
+        "Part detail",
+        ["—"] + sorted(by_pid.keys()),
+        key="pt_detail_pick",
+    )
+    if pick and pick != "—":
+        stp, rwa, inf = by_pid[pick]
         _render_part_detail_block(
-            part_id=pid, steps=steps, info=info, raw_steps=raw_steps
+            part_id=pick,
+            steps=stp,
+            info=inf,
+            raw_steps=rwa,
         )
-        total = len(steps)
-        n_pages = max(1, (total + page_size - 1) // page_size)
-        page = min(st.session_state.trace_page, n_pages - 1)
-        start = page * page_size
-        chunk = steps[start : start + page_size]
-        st.markdown("##### Event steps")
-        for row_idx, step in enumerate(chunk):
-            abs_n = start + row_idx + 1
-            c0, c1, c2, c3 = st.columns([1, 2, 2, 2])
-            with c0:
-                if step.get("is_entry"):
-                    st.markdown("**Entry**")
-                elif step.get("is_exit"):
-                    st.markdown("**Exit**")
-                else:
-                    st.write(abs_n)
-            with c1:
-                act = str(step.get("activity", ""))
-                au = act.upper()
-                if au == "FINISH":
-                    st.success(act)
-                elif au == "SCRAP":
-                    st.error(act)
-                else:
-                    st.write(act)
-            with c2:
-                st.write(step.get("component_id", ""))
-            with c3:
-                st.text(str(step.get("time", "")))
-        st.text("Page {}/{} · {} steps".format(page + 1, n_pages, total))
-        bc1, bc2, _ = st.columns([1, 1, 4])
-        if bc1.button("Previous", key="pt_prev_btn"):
-            st.session_state.trace_page = max(0, page - 1)
-            st.rerun()
-        if bc2.button("Next", key="pt_next_btn"):
-            st.session_state.trace_page = min(n_pages - 1, page + 1)
-            st.rerun()
-        st.text(p.get("flow", ""))
-    else:
-        st.caption("Part not found or no data in this session — tables stay visible.")
-        _ocfg = _part_track_overview_column_config(slim_overview=False)
-        st.markdown("##### Overview")
-        st.dataframe(
-            pd.DataFrame(columns=list(_ocfg.keys())),
-            use_container_width=True,
-            hide_index=True,
-            column_config=_ocfg,
-        )
-        st.markdown("##### Event steps")
-        st.dataframe(
-            pd.DataFrame(columns=["#", "Activity", "Station", "Time"]),
-            use_container_width=True,
-            hide_index=True,
-        )
+
+    with st.expander("Stage matrix (same data as Progress column)", expanded=False):
+        st.markdown("##### All parts · stage matrix")
+        _render_station_matrix(title="", parts_payload=matrix_payload)
+
+
+def _render_single_part(p: dict, event_level: str, page_size: int) -> None:
+    """One part (Part ID entered): overview row, detail block, paged event steps, raw flow."""
+    raw_steps = list(p.get("steps") or [])
+    steps = _filter_steps_for_level(raw_steps, event_level)
+    info = flow_classification.classify_flow_from_steps(raw_steps)
+    pid = str(p.get("part_id") or "")
+    st.markdown("##### Overview")
+    st.dataframe(
+        [
+            part_track_model.build_part_overview_row(
+                pid,
+                steps,
+                info,
+                preferred_stations=twin_layout.LOGGED_COMPONENT_IDS,
+                lifecycle_steps=raw_steps,
+            )
+        ],
+        use_container_width=True,
+        hide_index=True,
+        column_config=_part_track_overview_column_config(
+            slim_overview=False
+        ),
+    )
+    _render_part_detail_block(
+        part_id=pid, steps=steps, info=info, raw_steps=raw_steps
+    )
+    _render_event_steps_page(steps, page_size)
+    st.text(p.get("flow", ""))
+
+
+def _render_event_steps_page(steps: list[dict], page_size: int) -> None:
+    """One page of event steps with Previous / Next (page index in ``trace_page``)."""
+    total = len(steps)
+    n_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(st.session_state.trace_page, n_pages - 1)
+    start = page * page_size
+    chunk = steps[start : start + page_size]
+    st.markdown("##### Event steps")
+    for row_idx, step in enumerate(chunk):
+        _render_event_step_row(start + row_idx + 1, step)
+    st.text("Page {}/{} · {} steps".format(page + 1, n_pages, total))
+    bc1, bc2, _ = st.columns([1, 1, 4])
+    if bc1.button("Previous", key="pt_prev_btn"):
+        st.session_state.trace_page = max(0, page - 1)
+        st.rerun()
+    if bc2.button("Next", key="pt_next_btn"):
+        st.session_state.trace_page = min(n_pages - 1, page + 1)
+        st.rerun()
+
+
+def _render_event_step_row(abs_n: int, step: dict) -> None:
+    c0, c1, c2, c3 = st.columns([1, 2, 2, 2])
+    with c0:
+        if step.get("is_entry"):
+            st.markdown("**Entry**")
+        elif step.get("is_exit"):
+            st.markdown("**Exit**")
+        else:
+            st.write(abs_n)
+    with c1:
+        act = str(step.get("activity", ""))
+        au = act.upper()
+        if au == "FINISH":
+            st.success(act)
+        elif au == "SCRAP":
+            st.error(act)
+        else:
+            st.write(act)
+    with c2:
+        st.write(step.get("component_id", ""))
+    with c3:
+        st.text(str(step.get("time", "")))
+
+
+def _render_part_not_found() -> None:
+    st.caption("Part not found or no data in this session — tables stay visible.")
+    _ocfg = _part_track_overview_column_config(slim_overview=False)
+    st.markdown("##### Overview")
+    st.dataframe(
+        pd.DataFrame(columns=list(_ocfg.keys())),
+        use_container_width=True,
+        hide_index=True,
+        column_config=_ocfg,
+    )
+    st.markdown("##### Event steps")
+    st.dataframe(
+        pd.DataFrame(columns=["#", "Activity", "Station", "Time"]),
+        use_container_width=True,
+        hide_index=True,
+    )
