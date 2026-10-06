@@ -1,4 +1,5 @@
-# main_service.py - MQTT -> buffer -> Neo4j + KPI, print snapshot every 2s
+# main_service.py - MQTT -> buffer -> Neo4j + KPI; logs and publishes a KPI snapshot every
+# event_buffer.kpi_print_interval_sec seconds (default 2).
 
 import logging
 import os
@@ -103,33 +104,36 @@ def on_message(client, userdata, msg):
         logger.exception("on_message error: %s", e)
 
 
-def _print_kpi_snapshot(snap: dict, log_file=None):
-    """Print KPI snapshot, optionally write to log_file. 所有数值统一为浮点格式。"""
+def format_kpi_summary_lines(snap: dict) -> list[str]:
+    """System KPI line and one line per stage of the periodic KPI report.
+
+    Reads the snapshot's ``system`` block first and falls back to the older top-level keys.
+    """
     lines = []
-    lines.append("[Session] {}".format(pipeline.session_id or "N/A"))
     sysb = snap.get("system") or {}
-    cr = float(sysb.get("complete_rate", snap.get("throughput", 0)) or 0)
-    f = int(sysb.get("num_completions", snap.get("finished_count", 0)) or 0)
-    sct = int(sysb.get("num_scraps", snap.get("scrap_count", 0)) or 0)
-    sr = float(sysb.get("scrap_rate", snap.get("scrap_rate", 0)) or 0)
-    o = float(snap["observation_time_sec"])
-    a_fin = float(sysb.get("avg_cycle_time_fin", snap.get("avg_flow_time_sec", 0)) or 0)
-    a_all = float(sysb.get("avg_cycle_time_all", snap.get("avg_cycle_time_all_sec", 0)) or 0)
+    complete_rate = float(sysb.get("complete_rate", snap.get("throughput", 0)) or 0)
+    n_completions = int(sysb.get("num_completions", snap.get("finished_count", 0)) or 0)
+    n_scraps = int(sysb.get("num_scraps", snap.get("scrap_count", 0)) or 0)
+    scrap_rate = float(sysb.get("scrap_rate", snap.get("scrap_rate", 0)) or 0)
+    obs_time = float(snap["observation_time_sec"])
+    avg_cycle_fin = float(sysb.get("avg_cycle_time_fin", snap.get("avg_flow_time_sec", 0)) or 0)
+    avg_cycle_all = float(sysb.get("avg_cycle_time_all", snap.get("avg_cycle_time_all_sec", 0)) or 0)
     wip = int(sysb.get("wip_instantaneous", snap.get("current_wip", 0)) or 0)
-    awip = float(sysb.get("wip_average", snap.get("avg_wip", 0)) or 0)
+    avg_wip = float(sysb.get("wip_average", snap.get("avg_wip", 0)) or 0)
     lines.append(
         "[KPI system] NumCompletions={} NumScraps={} WIP={} AvgWIP={:.3f} CompleteRate={:.4f}/s "
         "ScrapRate={:.3f} AvgCycleFin={:.1f}s AvgCycleAll={:.1f}s obs_time={:.1f}s".format(
-            f, sct, wip, awip, cr, sr, a_fin, a_all, o
+            n_completions, n_scraps, wip, avg_wip, complete_rate, scrap_rate, avg_cycle_fin,
+            avg_cycle_all, obs_time
         )
     )
-    stg = snap.get("stages") or {}
-    for sk in sorted(stg.keys(), key=lambda x: int(str(x).replace("stage", "") or 0)):
-        row = stg[sk]
-        sn = str(sk).replace("stage", "") if str(sk).startswith("stage") else sk
+    stages = snap.get("stages") or {}
+    for stage_key in sorted(stages.keys(), key=lambda x: int(str(x).replace("stage", "") or 0)):
+        row = stages[stage_key]
+        stage_no = str(stage_key).replace("stage", "") if str(stage_key).startswith("stage") else stage_key
         lines.append(
             "[KPI stage {}] WIP={} AvgWIP={:.3f} NumDepartures={} Throughput={:.4f}/s AvgFlow={:.1f}s".format(
-                sn,
+                stage_no,
                 row.get("wip_instantaneous", row.get("instantaneous_wip", 0)),
                 float(row.get("wip_average", row.get("avg_wip", 0)) or 0),
                 row.get("num_departures", row.get("departures", 0)),
@@ -137,17 +141,15 @@ def _print_kpi_snapshot(snap: dict, log_file=None):
                 float(row.get("avg_flow_time", row.get("avg_flow_time_sec", 0)) or 0),
             )
         )
-    lines.append(
-        "[Buffer] size={}, flush_last={}, flush_2s={}, total={}".format(
-            pipeline.buffer.size,
-            _last_flush_count,
-            pipeline.flush_since_last_print,
-            pipeline.total_flush_count,
-        )
-    )
-    for sid, probs in snap.get("state_probability", {}).items():
-        util = snap["utilization"].get(sid, 0)
-        lines.append("  {}".format(sid))
+    return lines
+
+
+def format_station_state_lines(snap: dict) -> list[str]:
+    """Utilization and state probabilities per station, the last part of the KPI report."""
+    lines = []
+    for station_id, probs in snap.get("state_probability", {}).items():
+        util = snap["utilization"].get(station_id, 0)
+        lines.append("  {}".format(station_id))
         lines.append("    Utilization (P_busy): {:.2f}".format(util))
         lines.append(
             "    P_busy: {:.2f}  P_fail: {:.2f}  P_blocked: {:.2f}  P_idle: {:.2f}".format(
@@ -157,11 +159,31 @@ def _print_kpi_snapshot(snap: dict, log_file=None):
                 probs.get("idle", 0),
             )
         )
-    text = "\n".join(lines)
+    return lines
+
+
+def _log_kpi_report(snap: dict, log_file=None):
+    """Write the KPI report for ``snap`` to the app log, and to ``log_file`` (the kpi_log) if given.
+
+    The session id and the buffer counters are shared with the MQTT callback thread, so they
+    are read here, at their place in the report: after the summary lines are built (a bad
+    snapshot fails before any counter is read) and before the station lines.
+    """
+    lines = ["[Session] {}".format(pipeline.session_id or "N/A")]
+    lines += format_kpi_summary_lines(snap)
+    lines.append(
+        "[Buffer] size={}, flush_last={}, flush_2s={}, total={}".format(
+            pipeline.buffer.size,
+            _last_flush_count,
+            pipeline.flush_since_last_print,
+            pipeline.total_flush_count,
+        )
+    )
+    lines += format_station_state_lines(snap)
     for line in lines:
         logger.info("%s", line)
     if log_file:
-        log_file.write(text + "\n")
+        log_file.write("\n".join(lines) + "\n")
         log_file.flush()
 
 
@@ -182,7 +204,8 @@ mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
 mqtt_client.connect(MQTT_BROKER_HOST, port=MQTT_BROKER_PORT)
 mqtt_client.loop_start()
 
-# KPI 打印/发布间隔固定 2 秒（replay 时 buffer 用 replay_window_ms 平滑 WIP，但打印仍 2 秒一次）
+# KPI 记录/发布间隔：event_buffer.kpi_print_interval_sec，默认 2 秒；replay 模式也用同一间隔
+# （replay 只把 buffer 窗口换成 replay_window_ms）。
 KPI_PRINT_INTERVAL = BUFFER_CFG.get("kpi_print_interval_sec", 2.0)
 
 kpi_log_file = open(LOG_PATH, "w", encoding="utf-8")
@@ -201,7 +224,7 @@ try:
     while True:
         time.sleep(KPI_PRINT_INTERVAL)
         snap = pipeline.get_snapshot()
-        _print_kpi_snapshot(snap, kpi_log_file)
+        _log_kpi_report(snap, kpi_log_file)
         pipeline.flush_since_last_print = 0  # reset for next interval
 
         # Publish KPI to MQTT for web dashboard（含 session_id 供 UI 展示）
