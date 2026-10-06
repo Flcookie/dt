@@ -157,13 +157,6 @@ STATION_KPI_DISPLAY_NAME: dict[str, str] = {
     "station71": "M7-1",
 }
 
-_STATE_LABEL_EN = {
-    "busy": "Busy",
-    "fail": "Failed",
-    "blocked": "Blocked",
-    "idle": "Idle",
-}
-
 # Station state semantics（优化2 定稿：Busy 绿 / Idle 灰 / Blocked 黄 / Fail 红）
 _STATION_BUSY_COLOR = "#22c55e"
 _STATION_FAIL_COLOR = "#ef4444"
@@ -174,24 +167,6 @@ def station_kpi_display_name(sid: str) -> str:
     """工站 KPI 卡片标题：M1-1 …（与 Twin 一致；未知 id 则回退为原 id）。"""
     key = str(sid or "").strip().lower()
     return STATION_KPI_DISPLAY_NAME.get(key, sid or key or "—")
-
-
-def _dominant_state_key(pn: dict[str, float]) -> str:
-    """busy / fail / blocked / idle 中占比最大者（并列时按元组顺序先者优先）。"""
-    keys = ("busy", "fail", "blocked", "idle")
-    return max(keys, key=lambda s: float(pn.get(s, 0.0) or 0.0))
-
-
-def _state_key_dot_and_color(state_key: str) -> tuple[str, str]:
-    """Busy=绿 / Fail=红 / Blocked=黄 / Idle=灰。"""
-    k = (state_key or "idle").strip().lower()
-    if k == "busy":
-        return "\u25cf", _STATION_BUSY_COLOR
-    if k == "fail":
-        return "\u25cf", _STATION_FAIL_COLOR
-    if k == "blocked":
-        return "\u25cf", _STATION_BLOCKED_COLOR
-    return "\u25cf", _STATION_IDLE_COLOR
 
 
 @st.cache_data(ttl=60.0, show_spinner=False)
@@ -209,144 +184,6 @@ def default_station_ids() -> tuple[str, ...]:
     w = cfg.get("component_wips") or {}
     stations = [str(k) for k in w if str(k).startswith("station")]
     return tuple(sorted(stations)) if stations else tuple()
-
-
-def _format_runtime_hms(seconds: float) -> str:
-    sec = max(0, int(seconds))
-    h, rem = divmod(sec, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return "{:d}:{:02d}:{:02d}".format(h, m, s)
-    if m and s:
-        return "{:d} min {:d} s".format(m, s)
-    if m:
-        return "{:d} min".format(m)
-    return "{:d} s".format(s)
-
-
-def _four_state_percent_ints(b: float, f: float, bl: float, i: float) -> tuple[int, int, int, int]:
-    """整数百分比 busy/fail/blocked/idle，总和恒为 100（最大余数法）。全 Idle 时 (0,0,0,100)，条为整段灰。"""
-    b = max(0.0, min(1.0, float(b)))
-    f = max(0.0, min(1.0, float(f)))
-    bl = max(0.0, min(1.0, float(bl)))
-    i = max(0.0, min(1.0, float(i)))
-    sm = b + f + bl + i
-    if sm > 1e-9:
-        b, f, bl, i = b / sm, f / sm, bl / sm, i / sm
-    else:
-        b, f, bl, i = 0.0, 0.0, 0.0, 1.0
-    if b + f + bl < 1e-9:
-        return 0, 0, 0, 100
-    raw = [100.0 * b, 100.0 * f, 100.0 * bl, 100.0 * i]
-    base = [int(x) for x in raw]
-    rem = 100 - sum(base)
-    frac_order = sorted(
-        range(4), key=lambda j: raw[j] - base[j], reverse=True
-    )
-    for k in range(max(0, rem)):
-        base[frac_order[k % 4]] += 1
-    return base[0], base[1], base[2], base[3]
-
-
-def _station_stacked_bar_html(pn: dict[str, float]) -> str:
-    """单行四色堆叠条（无图例；全 Idle 时整段为 Idle 灰）。"""
-    b = max(0.0, min(1.0, float(pn.get("busy", 0.0) or 0.0)))
-    f = max(0.0, min(1.0, float(pn.get("fail", 0.0) or 0.0)))
-    bl = max(0.0, min(1.0, float(pn.get("blocked", 0.0) or 0.0)))
-    i = max(0.0, min(1.0, float(pn.get("idle", 0.0) or 0.0)))
-    sm = b + f + bl + i
-    if sm > 1e-9:
-        b, f, bl, i = b / sm, f / sm, bl / sm, i / sm
-    else:
-        b, f, bl, i = 0.0, 0.0, 0.0, 1.0
-    pb, pf, pbl, pi = _four_state_percent_ints(b, f, bl, i)
-    wb = float(pb)
-    wf = float(pf)
-    wbl = float(pbl)
-    wi = float(pi)
-    return (
-        '<div style="display:flex;height:7px;border-radius:4px;overflow:hidden;'
-        'width:100%;margin:4px 0 0 0;">'
-        '<div style="width:{:.4f}%;min-width:0;background:{};"></div>'
-        '<div style="width:{:.4f}%;min-width:0;background:{};"></div>'
-        '<div style="width:{:.4f}%;min-width:0;background:{};"></div>'
-        '<div style="width:{:.4f}%;min-width:0;background:{};"></div>'
-        "</div>"
-    ).format(
-        wb,
-        _STATION_BUSY_COLOR,
-        wf,
-        _STATION_FAIL_COLOR,
-        wbl,
-        _STATION_BLOCKED_COLOR,
-        wi,
-        _STATION_IDLE_COLOR,
-    )
-
-
-def _station_probs_normalize(probs: dict) -> dict[str, float]:
-    if not probs:
-        return {"busy": 0.0, "fail": 0.0, "blocked": 0.0, "idle": 1.0}
-    pl = {str(k).lower(): max(0.0, float(v or 0)) for k, v in probs.items()}
-    b = pl.get("busy", pl.get("loading", 0.0))
-    f = pl.get("fail", 0.0)
-    bl = pl.get("blocked", 0.0)
-    i = pl.get("idle", 0.0)
-    sm = b + f + bl + i
-    if sm > 1e-9:
-        b, f, bl, i = b / sm, f / sm, bl / sm, i / sm
-    else:
-        b, f, bl, i = 0.0, 0.0, 0.0, 1.0
-    return {"busy": b, "fail": f, "blocked": bl, "idle": i}
-
-
-def _station_compact_card_html(
-    sid: str,
-    util_raw,
-    probs: dict,
-    *,
-    live: dict | None = None,
-) -> str:
-    _ = util_raw, live
-    pn = _station_probs_normalize(probs)
-    body = _station_stacked_bar_html(pn)
-
-    dom = _dominant_state_key(pn)
-    dot, dot_color = _state_key_dot_and_color(dom)
-    line_lbl = html.escape(_STATE_LABEL_EN.get(dom, dom.title()))
-    title_esc = html.escape(station_kpi_display_name(sid))
-    top_bar = (
-        f"<div style='font-size:{_FONT_L5_PX}px;font-family:\"Barlow Condensed\",\"Segoe UI\",sans-serif;"
-        "color:{};margin:0 0 2px 0;line-height:1.35;letter-spacing:0.01em;"
-        "display:flex;align-items:center;flex-wrap:wrap;gap:6px 8px;'>"
-        "<span style='font-weight:700;color:{};'>{}</span>"
-        "<span style='color:{};font-size:1.02em;line-height:1;'>{}</span>"
-        "<b style='font-weight:600;'>{}</b>"
-        "</div>"
-    ).format(
-        _UI_THEME["text_dim"],
-        _UI_THEME["text"],
-        title_esc,
-        dot_color,
-        html.escape(dot),
-        line_lbl,
-    )
-
-    return (
-        "<div style='padding:10px 12px;border-radius:10px;box-sizing:border-box;"
-        "background:linear-gradient(165deg,{} 0%,{} 52%);"
-        "border:1px solid {};box-shadow:0 1px 2px rgba(15,23,42,0.06);"
-        "margin-bottom:10px;position:relative;overflow:hidden;'>"
-        "<div style='position:absolute;top:0;left:0;right:0;height:2px;"
-        "background:{};'></div>{}{}</div>"
-    ).format(
-        _UI_THEME["bg"],
-        _UI_THEME["surface"],
-        _UI_THEME["border"],
-        _UI_THEME["accent"],
-        top_bar,
-        body,
-    )
 
 
 # The State box and the fraction bars always list these nine mainline stations, in this order.
