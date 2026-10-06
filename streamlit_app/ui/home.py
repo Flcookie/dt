@@ -1113,6 +1113,38 @@ display:flex;align-items:center;gap:12px;">
                 st.rerun()
 
 
+# Greys out and blocks the Live header + controls (no mode chosen, History mode, or busy).
+_LIVE_LOCKED_CSS = """
+<style>
+div[data-testid="stMainBlockContainer"] div.st-key-home_live_head_row,
+div[data-testid="stMainBlockContainer"] div.st-key-home_live_ops_block {
+  pointer-events: none !important;
+  opacity: 0.48 !important;
+  filter: grayscale(0.15);
+  user-select: none;
+}
+div[data-testid="stMainBlockContainer"] div.st-key-home_live_head_row button,
+div[data-testid="stMainBlockContainer"] div.st-key-home_live_ops_block button {
+  cursor: not-allowed !important;
+}
+</style>
+"""
+
+# Greys out and blocks the History block (no mode chosen, or Live mode).
+_HIST_LOCKED_CSS = """
+<style>
+div[data-testid="stMainBlockContainer"] div.st-key-home_hist_ops_block {
+  pointer-events: none !important;
+  opacity: 0.48 !important;
+  filter: grayscale(0.15);
+  user-select: none;
+}
+</style>
+"""
+
+_BG_BUSY_TOAST = "Wait for the background operation to finish."
+
+
 def render() -> None:
     """Control + deploy + entry links. Caller must have set page_config and sidebar."""
     st.markdown(_HOME_UI_REFRESH_CSS, unsafe_allow_html=True)
@@ -1133,16 +1165,17 @@ def render() -> None:
     is_live = ds == "live"
     is_local = ds == "local"
 
-    _phys_disabled = _replay_session_active()
-    _bg_busy = process_control.is_control_operation_running()
-    ops_disabled = lock_all or is_local or _phys_disabled
-    _live_btn_disabled = ops_disabled
+    replay_active = _replay_session_active()
+    bg_busy = process_control.is_control_operation_running()
+    # Live controls are usable only in Live mode while no replay is running.
+    live_btn_disabled = lock_all or is_local or replay_active
 
-    if is_live and _phys_disabled:
+    if is_live and replay_active:
         st.info(
             "**Replay mode** — stop replay or use **Stop System** before starting the line."
         )
 
+    # Upload buttons need local_code_paths / local_config_paths in the active site config.
     _cfg_name = mqtt_backend.active_config_name() if not lock_all else "config.json"
     _cfg_path = os.path.normpath(os.path.join(PROJECT_ROOT, _cfg_name))
     try:
@@ -1150,16 +1183,68 @@ def render() -> None:
             _site_cfg = json.load(f)
     except OSError:
         _site_cfg = {}
-    _lcp = _site_cfg.get("local_code_paths")
-    _lcf = _site_cfg.get("local_config_paths")
-    _upload_code_ok = bool(_lcp)
-    _upload_cfg_ok = bool(_lcf)
+    local_code_paths = _site_cfg.get("local_code_paths")
+    local_config_paths = _site_cfg.get("local_config_paths")
 
     # Data Source
     with st.container(border=True):
         _render_data_source_configuration()
 
-    # Live — Programs/System 状态仅在 Live Monitoring 数据源下有意义
+    _render_live_section(
+        _live_status_html(is_live),
+        lock_all=lock_all,
+        locked=lock_all or is_local or bg_busy,
+        bg_busy=bg_busy,
+        buttons_disabled=live_btn_disabled,
+        local_code_paths=local_code_paths,
+        local_config_paths=local_config_paths,
+    )
+
+    # History
+    with st.container(border=True):
+        section_title("History", "#e67700", accent="#e67700")
+        hist_disabled = lock_all or is_live
+        if hist_disabled:
+            st.markdown(_HIST_LOCKED_CSS, unsafe_allow_html=True)
+        with st.container(key="home_hist_ops_block"):
+            ui_history_panel.render_history_panel(
+                key_prefix="home_hist", disabled=hist_disabled
+            )
+
+    # Navigate
+    with st.container(border=True):
+        section_title("Navigate", "#64748b", accent="#64748b")
+        n1, n2 = st.columns(2, gap="small")
+        with n1:
+            if st.button(
+                "KPI Dashboard",
+                key="home_dash_kpi",
+                use_container_width=True,
+                disabled=lock_all,
+            ):
+                st.switch_page("pages/01_Realtime.py")
+        with n2:
+            if st.button(
+                "Digital Twin",
+                key="home_dash_twin",
+                use_container_width=True,
+                disabled=lock_all,
+            ):
+                st.switch_page("pages/05_Digital_Twin.py")
+
+    # Other Services
+    with st.container(border=True):
+        section_title("Other Services", "#adb5bd", accent="#adb5bd")
+        if st.button(
+            "What-if Analysis",
+            key="home_what_if",
+            use_container_width=True,
+        ):
+            st.switch_page("pages/what-if-analysis.py")
+
+
+def _live_status_html(is_live: bool) -> str:
+    """"Programs: … | System: …" badge line; real status only in Live Monitoring mode."""
     if is_live:
         prog_raw = process_control.get_programs_status()
         sys_raw = process_control.get_system_status()
@@ -1193,7 +1278,7 @@ def render() -> None:
             'vertical-align:middle;margin:0 8px"></span>'
         )
 
-    status_html = (
+    return (
         "{}Programs: <b style='color:#212529'>{}</b>{}"
         "{}System: <b style='color:#212529'>{}</b>"
     ).format(
@@ -1204,31 +1289,30 @@ def render() -> None:
         sys_label,
     )
 
+
+def _render_live_section(
+    status_html: str,
+    *,
+    lock_all: bool,
+    locked: bool,
+    bg_busy: bool,
+    buttons_disabled: bool,
+    local_code_paths,
+    local_config_paths,
+) -> None:
+    """Live card: status + View logs, CONTROL (programs / line / shutdown), DEPLOY (uploads).
+
+    ``locked`` only greys the card out (CSS); ``buttons_disabled`` disables the widgets.
+    While ``bg_busy`` the buttons stay clickable but every action only shows a toast.
+    """
     with st.container(border=True):
         _render_live_section_header(status_html, logs_disabled=lock_all)
 
-        if _bg_busy:
+        if bg_busy:
             st.caption("Background operation in progress — controls paused until it finishes.")
 
-        if lock_all or is_local or _bg_busy:
-            st.markdown(
-                """
-<style>
-div[data-testid="stMainBlockContainer"] div.st-key-home_live_head_row,
-div[data-testid="stMainBlockContainer"] div.st-key-home_live_ops_block {
-  pointer-events: none !important;
-  opacity: 0.48 !important;
-  filter: grayscale(0.15);
-  user-select: none;
-}
-div[data-testid="stMainBlockContainer"] div.st-key-home_live_head_row button,
-motion[data-testid="stMainBlockContainer"] div.st-key-home_live_ops_block button {
-  cursor: not-allowed !important;
-}
-</style>
-""".replace("motion[", "div["),
-                unsafe_allow_html=True,
-            )
+        if locked:
+            st.markdown(_LIVE_LOCKED_CSS, unsafe_allow_html=True)
 
         with st.container(key="home_live_ops_block"):
             sub_label("CONTROL")
@@ -1238,110 +1322,51 @@ motion[data-testid="stMainBlockContainer"] div.st-key-home_live_ops_block button
                     "Start Programs",
                     key="home_start_progs",
                     use_container_width=True,
-                    disabled=_live_btn_disabled,
+                    disabled=buttons_disabled,
                 ):
-                    if _bg_busy:
-                        st.toast("Wait for the background operation to finish.")
-                    else:
-                        try:
-                            _enf = mqtt_backend.active_config_name()
-                            if not recording.is_recording():
-                                mqtt_backend.switch_config_file(_enf)
-                                time.sleep(1.0)
-                            process_control.reset_control_log_session()
-                            process_control.run_script_background(
-                                "start_programs", enforce_config=_enf
-                            )
-                            st.toast("Start Programs submitted. Check View Logs.")
-                        except Exception as ex:
-                            st.toast("Start Programs failed. Check View Logs.")
-                            process_control.record_control_action(
-                                "Start Programs", False, str(ex)
-                            )
+                    _submit_program_script(
+                        "Start Programs", "start_programs", bg_busy=bg_busy, reset_log=True
+                    )
             with c2:
                 if st.button(
                     "Start System",
                     key="home_btn_start",
                     use_container_width=True,
-                    disabled=_live_btn_disabled,
+                    disabled=buttons_disabled,
                 ):
-                    if _bg_busy:
-                        st.toast("Wait for the background operation to finish.")
-                    else:
-                        ok, msg = physical_workflow.start_physical_line_integrated()
-                        process_control.record_control_action(
-                            "Start System", ok, (msg or "")[:800]
-                        )
-                        if ok:
-                            st.toast("Start System done. See View Logs for details.")
-                        else:
-                            st.toast("Start System failed. See View Logs for details.")
+                    _run_line_action(
+                        "Start System",
+                        physical_workflow.start_physical_line_integrated,
+                        bg_busy=bg_busy,
+                    )
             with c3:
                 if st.button(
                     "Stop System",
                     key="home_btn_stop",
                     use_container_width=True,
-                    disabled=_live_btn_disabled,
+                    disabled=buttons_disabled,
                 ):
-                    if _bg_busy:
-                        st.toast("Wait for the background operation to finish.")
-                    else:
-                        ok, msg = physical_workflow.stop_physical_line_integrated()
-                        process_control.record_control_action(
-                            "Stop System", ok, (msg or "")[:800]
-                        )
-                        if ok:
-                            st.toast("Stop System done. See View Logs for details.")
-                        else:
-                            st.toast("Stop System failed. See View Logs for details.")
+                    _run_line_action(
+                        "Stop System",
+                        physical_workflow.stop_physical_line_integrated,
+                        bg_busy=bg_busy,
+                    )
             with c4:
                 if st.button(
                     "Stop Programs",
                     key="home_stop_progs",
                     use_container_width=True,
-                    disabled=_live_btn_disabled,
+                    disabled=buttons_disabled,
                 ):
-                    if _bg_busy:
-                        st.toast("Wait for the background operation to finish.")
-                    else:
-                        try:
-                            _enf = mqtt_backend.active_config_name()
-                            if not recording.is_recording():
-                                mqtt_backend.switch_config_file(_enf)
-                                time.sleep(1.0)
-                            process_control.run_script_background(
-                                "stop_programs", enforce_config=_enf
-                            )
-                            st.toast("Stop Programs submitted. Check View Logs.")
-                        except Exception as ex:
-                            st.toast("Stop Programs failed. Check View Logs.")
-                            process_control.record_control_action(
-                                "Stop Programs", False, str(ex)
-                            )
+                    _submit_program_script("Stop Programs", "stop_programs", bg_busy=bg_busy)
             with c5:
                 if st.button(
                     "Shutdown",
                     key="home_shutdown",
                     use_container_width=True,
-                    disabled=_live_btn_disabled,
+                    disabled=buttons_disabled,
                 ):
-                    if _bg_busy:
-                        st.toast("Wait for the background operation to finish.")
-                    else:
-                        try:
-                            _enf = mqtt_backend.active_config_name()
-                            if not recording.is_recording():
-                                mqtt_backend.switch_config_file(_enf)
-                                time.sleep(1.0)
-                            process_control.run_script_background(
-                                "shutdown", enforce_config=_enf
-                            )
-                            st.toast("Shutdown submitted. Check View Logs.")
-                        except Exception as ex:
-                            st.toast("Shutdown failed. Check View Logs.")
-                            process_control.record_control_action(
-                                "Shutdown", False, str(ex)
-                            )
+                    _submit_program_script("Shutdown", "shutdown", bg_busy=bg_busy)
 
             hr()
             sub_label("DEPLOY")
@@ -1351,89 +1376,83 @@ motion[data-testid="stMainBlockContainer"] div.st-key-home_live_ops_block button
                     "Upload Code",
                     key="home_ul_code",
                     use_container_width=True,
-                    disabled=_live_btn_disabled or not _upload_code_ok,
+                    disabled=buttons_disabled or not local_code_paths,
                 ):
-                    if _bg_busy:
-                        st.toast("Wait for the background operation to finish.")
-                    elif not _lcp:
-                        st.toast("Upload Code unavailable: local_code_paths empty.")
-                    else:
-                        _enf = mqtt_backend.active_config_name()
-                        process_control.run_script_background(
-                            "upload_code", enforce_config=_enf
-                        )
-                        st.toast("Upload Code submitted. Check View Logs.")
+                    _submit_upload(
+                        "Upload Code",
+                        "upload_code",
+                        local_code_paths,
+                        paths_key="local_code_paths",
+                        bg_busy=bg_busy,
+                    )
             with d2:
                 if st.button(
                     "Upload Config",
                     key="home_ul_cfg",
                     use_container_width=True,
-                    disabled=_live_btn_disabled or not _upload_cfg_ok,
+                    disabled=buttons_disabled or not local_config_paths,
                 ):
-                    if _bg_busy:
-                        st.toast("Wait for the background operation to finish.")
-                    elif not _lcf:
-                        st.toast("Upload Config unavailable: local_config_paths empty.")
-                    else:
-                        _enf = mqtt_backend.active_config_name()
-                        process_control.run_script_background(
-                            "upload_config", enforce_config=_enf
-                        )
-                        st.toast("Upload Config submitted. Check View Logs.")
+                    _submit_upload(
+                        "Upload Config",
+                        "upload_config",
+                        local_config_paths,
+                        paths_key="local_config_paths",
+                        bg_busy=bg_busy,
+                    )
 
         if recording.is_recording():
             st.warning("Recording · **{}**".format(recording.current_path() or ""))
 
-    # History
-    with st.container(border=True):
-        section_title("History", "#e67700", accent="#e67700")
-        _hist_disabled = lock_all or is_live
-        if _hist_disabled:
-            st.markdown(
-                """
-<style>
-div[data-testid="stMainBlockContainer"] div.st-key-home_hist_ops_block {
-  pointer-events: none !important;
-  opacity: 0.48 !important;
-  filter: grayscale(0.15);
-  user-select: none;
-}
-</style>
-""".replace("motion[", "div["),
-                unsafe_allow_html=True,
-            )
-        with st.container(key="home_hist_ops_block"):
-            ui_history_panel.render_history_panel(
-                key_prefix="home_hist", disabled=_hist_disabled
-            )
 
-    # Navigate
-    with st.container(border=True):
-        section_title("Navigate", "#64748b", accent="#64748b")
-        n1, n2 = st.columns(2, gap="small")
-        with n1:
-            if st.button(
-                "KPI Dashboard",
-                key="home_dash_kpi",
-                use_container_width=True,
-                disabled=lock_all,
-            ):
-                st.switch_page("pages/01_Realtime.py")
-        with n2:
-            if st.button(
-                "Digital Twin",
-                key="home_dash_twin",
-                use_container_width=True,
-                disabled=lock_all,
-            ):
-                st.switch_page("pages/05_Digital_Twin.py")
+def _submit_program_script(
+    label: str, script_name: str, *, bg_busy: bool, reset_log: bool = False
+) -> None:
+    """Start / Stop Programs and Shutdown: run the repo-root script in the background.
 
-    # Other Services
-    with st.container(border=True):
-        section_title("Other Services", "#adb5bd", accent="#adb5bd")
-        if st.button(
-            "What-if Analysis",
-            key="home_what_if",
-            use_container_width=True,
-        ):
-            st.switch_page("pages/what-if-analysis.py")
+    Unless recording, the active config is re-applied first (MQTT reconnect + 1 s pause).
+    ``reset_log`` starts a new control-log session (Start Programs only).
+    Failures are toasted and recorded as a failed control action.
+    """
+    if bg_busy:
+        st.toast(_BG_BUSY_TOAST)
+        return
+    try:
+        enforce_config = mqtt_backend.active_config_name()
+        if not recording.is_recording():
+            mqtt_backend.switch_config_file(enforce_config)
+            time.sleep(1.0)
+        if reset_log:
+            process_control.reset_control_log_session()
+        process_control.run_script_background(script_name, enforce_config=enforce_config)
+        st.toast("{} submitted. Check View Logs.".format(label))
+    except Exception as ex:
+        st.toast("{} failed. Check View Logs.".format(label))
+        process_control.record_control_action(label, False, str(ex))
+
+
+def _run_line_action(label: str, action, *, bg_busy: bool) -> None:
+    """Start / Stop System: run the integrated line workflow now and record its result.
+
+    Exceptions from ``action`` are not caught.
+    """
+    if bg_busy:
+        st.toast(_BG_BUSY_TOAST)
+        return
+    ok, msg = action()
+    process_control.record_control_action(label, ok, (msg or "")[:800])
+    if ok:
+        st.toast("{} done. See View Logs for details.".format(label))
+    else:
+        st.toast("{} failed. See View Logs for details.".format(label))
+
+
+def _submit_upload(label: str, script_name: str, paths, *, paths_key: str, bg_busy: bool) -> None:
+    """Upload Code / Config: run the repo-root upload script in the background (no config switch)."""
+    if bg_busy:
+        st.toast(_BG_BUSY_TOAST)
+    elif not paths:
+        st.toast("{} unavailable: {} empty.".format(label, paths_key))
+    else:
+        enforce_config = mqtt_backend.active_config_name()
+        process_control.run_script_background(script_name, enforce_config=enforce_config)
+        st.toast("{} submitted. Check View Logs.".format(label))
