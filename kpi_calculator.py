@@ -56,6 +56,18 @@ STATION_KPI_IDS: frozenset[str] = frozenset(
 
 _SPLITTER_MARK_ACTS = frozenset(("FORWARD", "RETURN"))
 
+# TRANSFER at these components is the formal exit of the given stage.
+_TRANSFER_EXIT_STAGE: dict[str, int] = {
+    "station11": 1,
+    "station31": 3,
+    "station61": 5,
+    "corner1": 6,
+}
+
+# Splitters whose TRANSFER exits a stage only after a FORWARD mark
+# (splitter1 -> stage 2; splitter3 / splitter4 -> stage 4, deduplicated per station41 LOAD).
+_FORWARD_EXIT_SPLITTERS = frozenset(("splitter1", "splitter3", "splitter4"))
+
 
 def _parse_ts(time_str: str) -> float:
     s = str(time_str).strip()
@@ -379,6 +391,24 @@ class KpiCalculator:
             del self._part_current_stage[part_id]
         self._assign_transit_after_exit(stage, part_id)
 
+    def _stage_exit_on_event(self, comp: str, act_u: str, part_id: str, ts: float) -> None:
+        """Formal stage exits.
+
+        Stations / corner1: TRANSFER exits the stage directly.
+        splitter1 (stage 2) and splitter3/4 (stage 4): FORWARD/RETURN is remembered per part,
+        and a later TRANSFER exits only if the last mark was FORWARD (not RETURN).
+        """
+        if comp in _FORWARD_EXIT_SPLITTERS:
+            if act_u in _SPLITTER_MARK_ACTS:
+                self.last_splitter_mark[(comp, part_id)] = act_u
+            elif act_u == "TRANSFER" and self.last_splitter_mark.get((comp, part_id)) == "FORWARD":
+                if comp == "splitter1":
+                    self._stage_exit(2, part_id, ts)
+                else:
+                    self._stage4_exit_dedup(part_id, ts)
+        elif act_u == "TRANSFER" and comp in _TRANSFER_EXIT_STAGE:
+            self._stage_exit(_TRANSFER_EXIT_STAGE[comp], part_id, ts)
+
     def _stn_ensure(self, sid: str, ts: float) -> None:
         if sid not in self._stn_state:
             self._stn_state[sid] = {
@@ -403,6 +433,93 @@ class KpiCalculator:
         self._stn_ensure(sid, ts)
         self._stn_elapse(sid, ts)
         self._stn_state[sid]["state"] = new_state
+
+    def _open_lap_on_start(self, part_id: str, ts: float) -> None:
+        """corner2 START: open a lap (system WIP +1); a part already in an open lap is not recounted."""
+        if part_id in self._open_lap:
+            self.duplicate_start_count += 1
+            if _kpi_wip_debug_enabled():
+                print(
+                    f"[KPI WIP] skip duplicate corner2 START {part_id!r} (lap still open), "
+                    f"sys_wip={self.sys_wip}",
+                    flush=True,
+                )
+            return
+
+        self._open_lap.add(part_id)
+        self._part_transit_stage[part_id] = 1
+        wip_before = self.sys_wip
+        self.sys_wip += 1
+        if _kpi_wip_debug_enabled():
+            print(
+                f"[KPI WIP+1] (comp,act)=('corner2','START') part_id={part_id!r} "
+                f"wip {wip_before}->{self.sys_wip}",
+                flush=True,
+            )
+        self._append_sys_wip(ts)
+        self.sys_start_time[part_id] = ts
+
+    def _close_lap(self, part_id: str, ts: float, act_u: str, *, finished: bool) -> None:
+        """splitter5 FINISH (``finished``) or SCRAP: close the open lap (system WIP -1).
+
+        Counts the completion/scrap and its cycle time from the lap's START.
+        A part without an open lap changes nothing (only the debug line is printed).
+        """
+        had_open = part_id in self._open_lap
+        wip_before = self.sys_wip
+        if had_open:
+            self._open_lap.discard(part_id)
+            self._clear_part_stage_state(part_id)
+            self.sys_wip = max(0, self.sys_wip - 1)
+            if finished:
+                self.num_completions += 1
+            else:
+                self.num_scraps += 1
+            self._append_sys_wip(ts)
+            start_ts = self.sys_start_time.get(part_id)
+            if start_ts is not None:
+                cycle_times = self.finished_cycle_times if finished else self.scrapped_cycle_times
+                cycle_times.append(ts - start_ts)
+        if _kpi_wip_debug_enabled():
+            print(
+                f"[KPI WIP-1 {'FINISH' if finished else 'SCRAP'}] part_id={part_id!r} "
+                f"had_open={had_open} wip {wip_before}->{self.sys_wip} act={act_u!r}",
+                flush=True,
+            )
+
+    def _update_station_state(self, sid: str, act_u: str, part_id: str, ts: float) -> None:
+        """Station state machine; other activities leave the station untouched.
+
+        LOAD -> BUSY; FAIL while BUSY -> FAIL; UNLOAD or BLOCK while BUSY/FAIL -> BLOCKED;
+        TRANSFER while BLOCKED -> IDLE (part cleared); PASS only records the current part.
+        """
+        if act_u == "FAIL":
+            self.fail_event_count += 1
+            self._stn_touched.add(sid)
+            self._stn_ensure(sid, ts)
+            if self._stn_state[sid]["state"] == "BUSY":
+                self._stn_set_state(sid, "FAIL", ts)
+        elif act_u == "LOAD":
+            self._stn_touched.add(sid)
+            self._stn_set_state(sid, "BUSY", ts)
+            if part_id:
+                self._stn_state[sid]["part"] = part_id
+        elif act_u in ("UNLOAD", "BLOCK"):
+            # BLOCK: downstream blocked before UNLOAD -> BLOCKED (not extended BUSY).
+            self._stn_touched.add(sid)
+            self._stn_ensure(sid, ts)
+            if self._stn_state[sid]["state"] in ("BUSY", "FAIL"):
+                self._stn_set_state(sid, "BLOCKED", ts)
+        elif act_u == "TRANSFER":
+            self._stn_touched.add(sid)
+            self._stn_ensure(sid, ts)
+            if self._stn_state[sid]["state"] == "BLOCKED":
+                self._stn_set_state(sid, "IDLE", ts)
+                self._stn_state[sid]["part"] = ""
+        elif act_u == "PASS" and part_id:
+            self._stn_touched.add(sid)
+            self._stn_ensure(sid, ts)
+            self._stn_state[sid]["part"] = part_id
 
     def on_event(self, event: dict) -> None:
         time_str = event.get("time")
@@ -439,167 +556,33 @@ class KpiCalculator:
             )
 
         if comp == "corner2" and act_u == "START" and part_id:
-            if part_id in self._open_lap:
-                self.duplicate_start_count += 1
-                if _kpi_wip_debug_enabled():
-                    print(
-                        f"[KPI WIP] skip duplicate corner2 START {part_id!r} (lap still open), "
-                        f"sys_wip={self.sys_wip}",
-                        flush=True,
-                    )
-            else:
-                self._open_lap.add(part_id)
-                self._part_transit_stage[part_id] = 1
-                w0 = self.sys_wip
-                self.sys_wip += 1
-                if _kpi_wip_debug_enabled():
-                    print(
-                        f"[KPI WIP+1] (comp,act)=({comp!r},{act_u!r}) part_id={part_id!r} "
-                        f"wip {w0}->{self.sys_wip}",
-                        flush=True,
-                    )
-                self._append_sys_wip(ts)
-                self.sys_start_time[part_id] = ts
+            self._open_lap_on_start(part_id, ts)
 
-        if comp == "splitter5" and act_u == "CHECKOUT":
-            pass  # hardware pre-signal; FINISH/SCRAP follow immediately
-
-        if comp == "splitter5" and act_u in self._finish_upper and part_id:
-            had = part_id in self._open_lap
-            w_before = self.sys_wip
-            if had:
-                self._open_lap.discard(part_id)
-                self._clear_part_stage_state(part_id)
-                self.sys_wip = max(0, self.sys_wip - 1)
-                self.num_completions += 1
-                self._append_sys_wip(ts)
-                st = self.sys_start_time.get(part_id)
-                if st is not None:
-                    self.finished_cycle_times.append(ts - st)
-            if _kpi_wip_debug_enabled():
-                print(
-                    f"[KPI WIP-1 FINISH] part_id={part_id!r} had_open={had} "
-                    f"wip {w_before}->{self.sys_wip} act={act_u!r}",
-                    flush=True,
-                )
-
-        if comp == "splitter5" and act_u in self._scrap_upper and part_id:
-            had = part_id in self._open_lap
-            w_before = self.sys_wip
-            if had:
-                self._open_lap.discard(part_id)
-                self._clear_part_stage_state(part_id)
-                self.sys_wip = max(0, self.sys_wip - 1)
-                self.num_scraps += 1
-                self._append_sys_wip(ts)
-                st = self.sys_start_time.get(part_id)
-                if st is not None:
-                    self.scrapped_cycle_times.append(ts - st)
-            if _kpi_wip_debug_enabled():
-                print(
-                    f"[KPI WIP-1 SCRAP] part_id={part_id!r} had_open={had} "
-                    f"wip {w_before}->{self.sys_wip} act={act_u!r}",
-                    flush=True,
-                )
+        # splitter5 CHECKOUT is a hardware pre-signal (FINISH/SCRAP follow) and is ignored.
+        # An activity listed in both finish_events and scrap_events is applied as FINISH first;
+        # the SCRAP pass then finds the lap already closed.
+        if comp == "splitter5" and part_id:
+            if act_u in self._finish_upper:
+                self._close_lap(part_id, ts, act_u, finished=True)
+            if act_u in self._scrap_upper:
+                self._close_lap(part_id, ts, act_u, finished=False)
 
         # -------- Stage entry (LOAD @ anchors) --------
         if act_u == "LOAD" and comp in STAGE_ENTRY and part_id:
             self._stage_entry(STAGE_ENTRY[comp], part_id, ts)
 
         # -------- Stage exits --------
-        if comp == "station11" and act_u == "TRANSFER" and part_id:
-            self._stage_exit(1, part_id, ts)
-
-        if comp == "splitter1" and act_u in _SPLITTER_MARK_ACTS and part_id:
-            self.last_splitter_mark[("splitter1", part_id)] = act_u
-        if comp == "splitter1" and act_u == "TRANSFER" and part_id:
-            if self.last_splitter_mark.get(("splitter1", part_id)) == "FORWARD":
-                self._stage_exit(2, part_id, ts)
-
-        if comp == "station31" and act_u == "TRANSFER" and part_id:
-            self._stage_exit(3, part_id, ts)
-
-        if comp == "splitter3" and act_u in _SPLITTER_MARK_ACTS and part_id:
-            self.last_splitter_mark[("splitter3", part_id)] = act_u
-        if comp == "splitter4" and act_u in _SPLITTER_MARK_ACTS and part_id:
-            self.last_splitter_mark[("splitter4", part_id)] = act_u
-        if comp == "splitter3" and act_u == "TRANSFER" and part_id:
-            if self.last_splitter_mark.get(("splitter3", part_id)) == "FORWARD":
-                self._stage4_exit_dedup(part_id, ts)
-        if comp == "splitter4" and act_u == "TRANSFER" and part_id:
-            if self.last_splitter_mark.get(("splitter4", part_id)) == "FORWARD":
-                self._stage4_exit_dedup(part_id, ts)
-
-        if comp == "station61" and act_u == "TRANSFER" and part_id:
-            self._stage_exit(5, part_id, ts)
-
-        if comp == "corner1" and act_u == "TRANSFER" and part_id:
-            self._stage_exit(6, part_id, ts)
+        if part_id:
+            self._stage_exit_on_event(comp, act_u, part_id, ts)
 
         # -------- Station BUSY / FAIL / BLOCKED / IDLE --------
         if comp in STATION_KPI_IDS:
-            if act_u == "FAIL":
-                self.fail_event_count += 1
-                self._stn_touched.add(comp)
-                self._stn_ensure(comp, ts)
-                if self._stn_state[comp]["state"] == "BUSY":
-                    self._stn_set_state(comp, "FAIL", ts)
-            elif act_u == "LOAD":
-                self._stn_touched.add(comp)
-                self._stn_set_state(comp, "BUSY", ts)
-                if part_id:
-                    self._stn_state[comp]["part"] = part_id
-            elif act_u == "UNLOAD":
-                self._stn_touched.add(comp)
-                self._stn_ensure(comp, ts)
-                if self._stn_state[comp]["state"] in ("BUSY", "FAIL"):
-                    self._stn_set_state(comp, "BLOCKED", ts)
-            elif act_u == "BLOCK":
-                self._stn_touched.add(comp)
-                self._stn_ensure(comp, ts)
-                if self._stn_state[comp]["state"] in ("BUSY", "FAIL"):
-                    self._stn_set_state(comp, "BLOCKED", ts)
-            elif act_u == "TRANSFER":
-                self._stn_touched.add(comp)
-                self._stn_ensure(comp, ts)
-                if self._stn_state[comp]["state"] == "BLOCKED":
-                    self._stn_set_state(comp, "IDLE", ts)
-                    self._stn_state[comp]["part"] = ""
-            elif act_u == "PASS" and part_id:
-                self._stn_touched.add(comp)
-                self._stn_ensure(comp, ts)
-                self._stn_state[comp]["part"] = part_id
+            self._update_station_state(comp, act_u, part_id, ts)
 
         self._sync_stage_wip_at(ts)
 
-    def get_snapshot(self) -> dict[str, Any]:
-        if self.observation_time_mode == "replay":
-            end_ts = float(self.last_event_ts) if self.last_event_ts is not None else datetime.datetime.now().timestamp()
-        else:
-            now = datetime.datetime.now().timestamp()
-            last = float(self.last_event_ts) if self.last_event_ts is not None else now
-            end_ts = last if (now - last) > 30.0 else now
-
-        start_ts = self.observation_start_ts
-        obs_time = max(0.001, (end_ts - start_ts) if start_ts is not None else 0.001)
-
-        if self.last_event_ts is not None:
-            self._sync_stage_wip_at(float(self.last_event_ts))
-
-        avg_sys_wip = round(_wip_average_confirmed(self.sys_wip_history, obs_time, end_ts), 3)
-
-        departed = self.num_completions + self.num_scraps
-        scrap_rate_kpi = round(self.num_scraps / departed, 3) if departed > 0 else 0.0
-        complete_rate = round(self.num_completions / obs_time, 4)
-
-        avg_ct_fin = (
-            round(sum(self.finished_cycle_times) / len(self.finished_cycle_times), 1)
-            if self.finished_cycle_times
-            else 0.0
-        )
-        all_ct = self.finished_cycle_times + self.scrapped_cycle_times
-        avg_ct_all = round(sum(all_ct) / len(all_ct), 1) if all_ct else 0.0
-
+    def _stage_kpis(self, obs_time: float, end_ts: float) -> dict[str, dict[str, Any]]:
+        """Per stage: current / time-averaged WIP, departures, throughput, mean flow time."""
         stages_out: dict[str, dict[str, Any]] = {}
         for s in range(1, 7):
             hist = self.stage_wip_hist[s]
@@ -615,7 +598,16 @@ class KpiCalculator:
                 "throughput": thr,
                 "avg_flow_time": avg_ft,
             }
+        return stages_out
 
+    def _station_kpis(
+        self, end_ts: float
+    ) -> tuple[dict[str, float], dict[str, dict[str, float]], dict[str, dict[str, str]]]:
+        """Per station: utilization (P_busy + P_fail), state probabilities, live state.
+
+        The current state's open interval is counted up to ``end_ts``. Stations without
+        any state event report idle = 1.0.
+        """
         utilization: dict[str, float] = {}
         state_probability: dict[str, dict[str, float]] = {}
         station_live: dict[str, dict[str, str]] = {}
@@ -669,6 +661,39 @@ class KpiCalculator:
                 "current_part_id": str(st.get("part") or "").strip(),
                 "queue_hint": "",
             }
+        return utilization, state_probability, station_live
+
+    def get_snapshot(self) -> dict[str, Any]:
+        if self.observation_time_mode == "replay":
+            end_ts = float(self.last_event_ts) if self.last_event_ts is not None else datetime.datetime.now().timestamp()
+        else:
+            now = datetime.datetime.now().timestamp()
+            last = float(self.last_event_ts) if self.last_event_ts is not None else now
+            end_ts = last if (now - last) > 30.0 else now
+
+        start_ts = self.observation_start_ts
+        obs_time = max(0.001, (end_ts - start_ts) if start_ts is not None else 0.001)
+
+        if self.last_event_ts is not None:
+            self._sync_stage_wip_at(float(self.last_event_ts))
+
+        avg_sys_wip = round(_wip_average_confirmed(self.sys_wip_history, obs_time, end_ts), 3)
+
+        departed = self.num_completions + self.num_scraps
+        scrap_rate_kpi = round(self.num_scraps / departed, 3) if departed > 0 else 0.0
+        complete_rate = round(self.num_completions / obs_time, 4)
+
+        avg_ct_fin = (
+            round(sum(self.finished_cycle_times) / len(self.finished_cycle_times), 1)
+            if self.finished_cycle_times
+            else 0.0
+        )
+        all_ct = self.finished_cycle_times + self.scrapped_cycle_times
+        avg_ct_all = round(sum(all_ct) / len(all_ct), 1) if all_ct else 0.0
+
+        stages_out = self._stage_kpis(obs_time, end_ts)
+
+        utilization, state_probability, station_live = self._station_kpis(end_ts)
 
         if self.last_event_ts is not None:
             chart_time_unix = float(self.last_event_ts)
