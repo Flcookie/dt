@@ -1,18 +1,36 @@
 # run_tests.py - Run all tests and report
+#
+# Each group runs under pytest so every test function is executed (running a test file as a
+# plain script only executes its optional __main__ block). pytest must be installed; the
+# streamlit_app UI tests also need streamlit (requirements.txt) and are skipped without it.
 
+import os
 import subprocess
 import sys
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
 tests = [
-    ("event_buffer", "test_event_buffer.py"),
-    ("KPI calculator", "test_kpi_calculator.py"),
-    ("streamlit_app", "test_streamlit_imports.py"),
+    # No dedicated event_buffer test file exists; EventBuffer is exercised through the
+    # pipeline tests here and the plant-log regression in test_kpi_calculator.py.
+    ("event pipeline / buffer", ["test_event_pipeline.py"]),
+    ("KPI calculator", ["test_kpi_calculator.py"]),
+    ("replay scripts", ["test_replay_direct.py"]),
+    (
+        "streamlit_app",
+        [
+            "test_mqtt_backend_replay.py",
+            "test_history_panel_ui.py",
+            "test_part_trace_panel_ui.py",
+            "test_home_ui.py",
+        ],
+    ),
 ]
 
 failed = []
-for name, script in tests:
+for name, files in tests:
     print(f"\n--- {name} ---")
-    r = subprocess.run([sys.executable, script], capture_output=False)
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", *files], cwd=ROOT)
     if r.returncode != 0:
         failed.append(name)
 

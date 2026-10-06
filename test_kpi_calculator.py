@@ -597,7 +597,7 @@ def test_scrap_lap_keeps_visited_slots_done_not_scrap_cells():
     import sys
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "streamlit_app"))
-    import part_track_conformance as ptc
+    import part_track.part_track_conformance as ptc
 
     steps = [
         {"timestamp": 1.0, "time": "2026-05-09T16:00:00", "component_id": "corner2", "activity": "START"},
@@ -628,7 +628,7 @@ def test_station41_station71_pass_events_are_meaningful():
     import sys
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "streamlit_app"))
-    import part_track_conformance as ptc
+    import part_track.part_track_conformance as ptc
 
     for comp in ("station41", "station71"):
         ev = {"component_id": comp, "activity": "PASS"}
@@ -639,7 +639,7 @@ def test_splitter2_corner1_splitter5_return_events_are_meaningful():
     import sys
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "streamlit_app"))
-    import part_track_conformance as ptc
+    import part_track.part_track_conformance as ptc
 
     assert ptc.event_is_meaningful(
         {"component_id": "splitter2", "activity": "FORWARD"}
@@ -662,7 +662,7 @@ def test_scrap_on_non_splitter5_does_not_close_lap():
     import sys
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "streamlit_app"))
-    import part_track_conformance as ptc
+    import part_track.part_track_conformance as ptc
 
     steps = [
         {"timestamp": 1.0, "time": "2026-05-09T16:00:00", "component_id": "corner2", "activity": "START"},
@@ -678,7 +678,7 @@ def test_flow_step_grid_separates_m4_m5_first_and_second_pass():
     import sys
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "streamlit_app"))
-    import flow_conformance_engine as fce
+    import part_track.flow_conformance_engine as fce
 
     st = fce.new_flow_state()
     for idx in (0, 1, 2, 3, 4):
@@ -694,7 +694,7 @@ def test_factory_floor_event_cursor_no_dup_or_gap():
     import sys
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "streamlit_app"))
-    import factory_floor_sim as ffs
+    import twin.factory_floor_sim as ffs
 
     events = [
         {"timestamp": 1.0, "event_id": "a", "part_id": "p1", "component_id": "corner2", "activity": "START", "time": "t1"},
