@@ -224,6 +224,13 @@ def test_live_replay_shows_stop_button_and_stop_clears_child(env):
     assert at.button(key=TOGGLE).label == "Start Replay"
 
 
+def test_finished_replay_is_cleaned_up_on_render(env):
+    at = env.run(replay_proc=_Proc(3333, alive=False))
+    assert ("clear_replay_child",) in env.calls  # the finished worker's state is cleared first
+    assert at.button(key=TOGGLE).label == "Start Replay"
+    assert not any("Replay started" in m.value for m in at.markdown)
+
+
 def test_import_ok_selects_new_session_after_rerun(env):
     env.cfg["upload"] = CSV_OK
     env.cfg["sessions"] = SESSIONS + [{"id": "new_sid", "label": "New", "event_count": 2, "status_badge": "closed"}]

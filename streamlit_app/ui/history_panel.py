@@ -337,15 +337,10 @@ def render_history_panel(*, key_prefix: str = "hist", disabled: bool = False) ->
 
     sel_ids, id_to_label = _sync_session_choices(kp, sess_key, d)
 
-    _rp = st.session_state.get("replay_proc")
-    if _rp is not None and _rp.poll() is not None:
-        ui_replay_panel.stop_replay_and_clear_state()
+    ui_replay_panel.clean_up_finished_replay()
 
     rec_on = recording.is_recording()
-    replay_live = (
-        st.session_state.get("replay_proc") is not None
-        and st.session_state.replay_proc.poll() is None
-    )
+    replay_live = ui_replay_panel.running_replay_process() is not None
 
     chosen_id, export_sid = _render_session_select(
         sess_key, export_sid_key, sel_ids, id_to_label, d, replay_live
@@ -529,14 +524,14 @@ def _render_replay_export_toolbar(
                 else:
                     st.session_state[export_sid_key] = replay_sid
                     _start_session_replay(replay_sid, speed)
-            _rp_show = st.session_state.get("replay_proc")
-            if _rp_show is not None and _rp_show.poll() is None:
+            running = ui_replay_panel.running_replay_process()  # may have just been started above
+            if running is not None:
                 st.markdown(
                     (
                         '<p class="hist-replay-status-line">'
                         "Replay started · PID <strong>{}</strong>"
                         "</p>"
-                    ).format(_rp_show.pid),
+                    ).format(running.pid),
                     unsafe_allow_html=True,
                 )
 

@@ -155,6 +155,28 @@ def test_live_replay_disables_controls_with_info(env):
     ]
 
 
+class _ReplayProc:
+    def __init__(self, alive):
+        self.alive = alive
+
+    def poll(self):
+        return None if self.alive else 0
+
+
+def test_running_replay_worker_disables_controls(env):
+    at = env.run(cp_data_source="live", replay_proc=_ReplayProc(alive=True))  # KPI is not in replay mode
+    assert all(_disabled(at, CONTROL_KEYS + UPLOAD_KEYS).values())
+    assert [i.value for i in at.info] == [
+        "**Replay mode** — stop replay or use **Stop System** before starting the line."
+    ]
+
+
+def test_finished_replay_worker_does_not_disable_controls(env):
+    at = env.run(cp_data_source="live", replay_proc=_ReplayProc(alive=False))
+    assert not any(_disabled(at, CONTROL_KEYS).values())
+    assert [i.value for i in at.info] == []
+
+
 def test_background_busy_blocks_every_action_with_toast(env):
     env.cfg["bg_busy"] = True
     at = env.run(cp_data_source="live")

@@ -77,3 +77,41 @@ def test_clear_kpi_before_replay(state, monkeypatch):
     replay_panel.clear_kpi_before_replay()
     assert calls == ["clear_kpi_snapshot", ("sleep", 0.15)]
     assert state == {"replay_proc": "kept"}
+
+
+class _CountingProc:
+    def __init__(self, running):
+        self.running = running
+        self.polls = 0
+
+    def poll(self):
+        self.polls += 1
+        return None if self.running else 0
+
+
+@pytest.mark.parametrize("running", [True, False])
+def test_running_replay_process_polls_once(state, running):
+    proc = _CountingProc(running)
+    state.update(replay_proc=proc)
+    assert replay_panel.running_replay_process() is (proc if running else None)
+    assert proc.polls == 1
+    assert state["replay_proc"] is proc  # only reads the state
+
+
+def test_running_replay_process_without_worker(state):
+    assert replay_panel.running_replay_process() is None
+    state.update(replay_proc=None)
+    assert replay_panel.running_replay_process() is None
+
+
+@pytest.mark.parametrize("running, cleaned", [(True, False), (False, True)])
+def test_clean_up_finished_replay_only_clears_an_exited_worker(state, monkeypatch, running, cleaned):
+    calls = []
+    monkeypatch.setattr(replay_panel, "stop_replay_and_clear_state", lambda: calls.append("stop"))
+    proc = _CountingProc(running)
+    state.update(replay_proc=proc)
+    replay_panel.clean_up_finished_replay()
+    assert calls == (["stop"] if cleaned else []) and proc.polls == 1
+    state.update(replay_proc=None)
+    replay_panel.clean_up_finished_replay()  # no worker: nothing to do
+    assert calls == (["stop"] if cleaned else [])

@@ -404,8 +404,7 @@ def hr() -> None:
 
 
 def _replay_session_active() -> bool:
-    p = st.session_state.get("replay_proc")
-    if p is not None and p.poll() is None:
+    if ui_replay_panel.running_replay_process() is not None:
         return True
     kpi, _ = mqtt_backend.get_kpi_snapshot()
     return (kpi or {}).get("run_mode") == "replay"
