@@ -903,3 +903,107 @@ def test_repeated_snapshot_without_new_events_is_unchanged(clock):
     _start_finish(kpi, "p1", 0, 10)
     kpi.on_event({"time": _iso(12), "component_id": "station11", "part_id": "p2", "activity": "LOAD"})
     assert kpi.get_snapshot() == kpi.get_snapshot()
+
+
+# ---- on_event: lap, stage and station rules (expected values by hand) ----
+
+
+def _ev(kpi, seconds, component, part, activity):
+    kpi.on_event({"time": _iso(seconds), "component_id": component, "part_id": part, "activity": activity})
+
+
+def _ts(seconds):
+    return (_T0 + _dt.timedelta(seconds=seconds)).timestamp()
+
+
+def test_events_without_time_are_ignored():
+    kpi = kpi_calculator.KpiCalculator(observation_time_mode="replay")
+    before = dict(vars(kpi))
+    kpi.on_event({"component_id": "corner2", "part_id": "p1", "activity": "START"})
+    kpi.on_event({"time": "", "component_id": "corner2", "part_id": "p1", "activity": "START"})
+    assert vars(kpi) == before
+
+
+def test_finish_scrap_or_checkout_without_open_lap_change_nothing():
+    kpi = kpi_calculator.KpiCalculator(observation_time_mode="replay")
+    _ev(kpi, 0, "splitter5", "p1", "FINISH")  # no START
+    _ev(kpi, 1, "splitter5", "p2", "SCRAP")  # no START
+    _ev(kpi, 2, "corner2", "p3", "START")
+    _ev(kpi, 3, "splitter5", "p3", "CHECKOUT")  # pre-signal only
+    _ev(kpi, 7, "splitter5", "p3", "FINISH")
+    _ev(kpi, 8, "splitter5", "p3", "SCRAP")  # lap already closed
+    assert (kpi.num_completions, kpi.num_scraps, kpi.sys_wip) == (1, 0, 0)
+    assert kpi.sys_wip_history == [(_ts(2), 1), (_ts(7), 0)]
+    assert kpi.finished_cycle_times == [5.0] and kpi.scrapped_cycle_times == []
+
+
+def test_activity_listed_as_finish_and_scrap_counts_as_completion_only():
+    kpi = kpi_calculator.KpiCalculator(observation_time_mode="replay", finish_events=["FINISH", "SCRAP"])
+    _ev(kpi, 0, "corner2", "p1", "START")
+    _ev(kpi, 4, "splitter5", "p1", "SCRAP")
+    assert (kpi.num_completions, kpi.num_scraps, kpi.sys_wip) == (1, 0, 0)
+    assert kpi.finished_cycle_times == [4.0] and kpi.scrapped_cycle_times == []
+
+
+def test_stage_wip_follows_the_part_through_exits_and_looping_loads():
+    kpi = kpi_calculator.KpiCalculator(observation_time_mode="replay")
+    steps = [  # (s, component, activity, stage WIP 1..6 after the event)
+        (0, "corner2", "START", [1, 0, 0, 0, 0, 0]),  # before the first anchor: stage 1
+        (1, "station11", "LOAD", [1, 0, 0, 0, 0, 0]),
+        (3, "station11", "TRANSFER", [0, 1, 0, 0, 0, 0]),  # stage 1 exit: counted in stage 2
+        (4, "station21", "LOAD", [0, 1, 0, 0, 0, 0]),
+        (5, "station22", "LOAD", [0, 1, 0, 0, 0, 0]),  # looping LOAD: closes the first pass
+        (6, "splitter1", "FORWARD", [0, 1, 0, 0, 0, 0]),
+        (7, "splitter1", "TRANSFER", [0, 1, 0, 0, 0, 0]),  # stage 2 exit: still counted in stage 2
+        (8, "station31", "LOAD", [0, 0, 1, 0, 0, 0]),
+        (12, "station31", "TRANSFER", [0, 0, 0, 1, 0, 0]),
+    ]
+    for seconds, component, activity, wip in steps:
+        _ev(kpi, seconds, component, "p1", activity)
+        assert [kpi.stage_wip[s] for s in range(1, 7)] == wip, (seconds, component, activity)
+    assert kpi.stage_departures == {1: 1, 2: 2, 3: 1, 4: 0, 5: 0, 6: 0}
+    assert dict(kpi.stage_flow_times) == {1: [2.0], 2: [1.0, 2.0], 3: [4.0]}
+    assert kpi.stage_forced_exits == {s: 0 for s in range(1, 7)}
+    assert kpi.stage_wip_hist[2] == [(_ts(3), 1), (_ts(8), 0)]
+    assert kpi._part_current_stage == {} and kpi._part_transit_stage == {"p1": 4}
+    assert kpi.stage_entry_time == {}
+
+
+def test_station_state_transitions_and_booked_time():
+    kpi = kpi_calculator.KpiCalculator(observation_time_mode="replay")
+    steps = [  # (s, activity, part, state and current part after the event)
+        (0, "UNLOAD", "d", "IDLE", ""),  # first event: tracked as IDLE from 0 s; UNLOAD needs BUSY/FAIL
+        (1, "TRANSFER", "d", "IDLE", ""),  # TRANSFER needs BLOCKED
+        (2, "FAIL", "d", "IDLE", ""),  # counted, but FAIL needs BUSY
+        (3, "LOAD", "d", "BUSY", "d"),  # IDLE 0-3
+        (5, "TRANSFER", "d", "BUSY", "d"),
+        (6, "FAIL", "d", "FAIL", "d"),  # BUSY 3-6
+        (8, "LOAD", "d", "BUSY", "d"),  # FAIL 6-8
+        (9, "BLOCK", "d", "BLOCKED", "d"),  # BUSY 8-9
+        (10, "PASS", "", "BLOCKED", "d"),  # PASS without a part: ignored
+        (11, "PASS", "e", "BLOCKED", "e"),
+        (13, "TRANSFER", "e", "IDLE", ""),  # BLOCKED 9-13
+        (12, "LOAD", "f", "BUSY", "f"),  # late event: no negative IDLE time; BUSY from 12 s
+    ]
+    for seconds, activity, part, state, current_part in steps:
+        _ev(kpi, seconds, "station21", part, activity)
+        station = kpi._stn_state["station21"]
+        assert (station["state"], station["part"]) == (state, current_part), (seconds, activity)
+    assert kpi._stn_state["station21"]["start"] == _ts(12)
+    assert kpi._stn_acc["station21"] == {"BUSY": 4.0, "FAIL": 2.0, "BLOCKED": 4.0, "IDLE": 3.0}
+    assert kpi.fail_event_count == 2
+    _ev(kpi, 20, "station31", "", "PASS")  # a PASS without a part does not start tracking a station
+    assert "station31" not in kpi._stn_state and kpi._stn_touched == {"station21"}
+
+
+@pytest.mark.parametrize("cap, expected_lines", [("0", 0), ("1", 2), ("2", 3)])
+def test_missing_part_warnings_stop_at_the_cap(monkeypatch, capsys, cap, expected_lines):
+    monkeypatch.setenv("KPI_MISSING_PART_WARN_MAX", cap)
+    kpi = kpi_calculator.KpiCalculator(observation_time_mode="replay")
+    for seconds in range(3):
+        _ev(kpi, seconds, "station11", "", "LOAD")
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == expected_lines  # cap warnings, then one "suppressed" note
+    assert all(line.startswith("[KPI WARNING] missing part id") for line in lines[:-1])
+    if lines:
+        assert lines[-1].startswith("[kpi_calculator] Further missing-part warnings suppressed")

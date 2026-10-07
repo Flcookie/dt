@@ -7,13 +7,21 @@
 # Stage: entry on LOAD at anchor stations; exits per splitter TRANSFER rules and station TRANSFERs.
 #   **One stage per open lap at a time**: sum of stage ``wip_instantaneous`` equals system WIP.
 #   Parts between formal exit and next anchor LOAD sit in ``_part_transit_stage`` (still counted).
-#   corner2 START assigns transit stage 1 until first anchor LOAD. Stage4: splitter3/4 one exit per
-#   ``station41`` LOAD per part. Looping substations (station22 / station51 / station52) re-enter same stage.
+#   corner2 START assigns transit stage 1 until first anchor LOAD. Stage4: splitter3/4 exit at most
+#   once per Stage4 entry LOAD (open question 1). Looping stages: a repeated LOAD closes a pass.
 # Station: BUSY / FAIL / BLOCKED / IDLE state machine; utilization = P_busy + P_fail.
 # BLOCK @ station*: downstream blocked before UNLOAD → BLOCKED (not extended BUSY).
 # splitter5 CHECKOUT: pre-notification before FINISH/SCRAP; ignored for KPI counts.
 #
 # Part id: part_id, partId, entity_id, entityId — see _extract_part_id.
+#
+# Open questions (implemented behaviour kept as is):
+#   1. Stage4 exits: the original note said "one per station41 LOAD"; the code allows one per
+#      Stage4 entry LOAD (station41 / station51 / station52).
+#   2. Looping stages 2, 4, 6: why a part stays counted in the same stage after a formal exit,
+#      and why stage 6 (station71 only) loops at all.
+#   3. Realtime window: why it falls back to the last event 30 s after it (_observation_end_ts).
+#   4. Station shares cover the time since the station's first event, not the whole window.
 
 from __future__ import annotations
 
@@ -56,6 +64,12 @@ STATION_KPI_IDS: frozenset[str] = frozenset(
 
 _SPLITTER_MARK_ACTS = frozenset(("FORWARD", "RETURN"))
 
+# A repeated LOAD in these stages closes the previous pass (open question 2).
+_LOOPING_STAGES = (2, 4, 6)
+
+# Activities that should carry a part id; without one a (capped) warning is printed.
+_ACTIVITIES_NEEDING_PART_ID = ("START", "FINISH", "LOAD", "UNLOAD", "TRANSFER", "SCRAP", "FAIL")
+
 # TRANSFER at these components is the formal exit of the given stage.
 _TRANSFER_EXIT_STAGE: dict[str, int] = {
     "station11": 1,
@@ -65,7 +79,7 @@ _TRANSFER_EXIT_STAGE: dict[str, int] = {
 }
 
 # Splitters whose TRANSFER exits a stage only after a FORWARD mark
-# (splitter1 -> stage 2; splitter3 / splitter4 -> stage 4, deduplicated per station41 LOAD).
+# (splitter1 -> stage 2; splitter3 / splitter4 -> stage 4).
 _FORWARD_EXIT_SPLITTERS = frozenset(("splitter1", "splitter3", "splitter4"))
 
 
@@ -257,10 +271,12 @@ class KpiCalculator:
         self.last_event_ts: float | None = None
 
         # --- System ---
+        # System WIP = number of open laps; history gets (ts, WIP) when a lap opens or closes.
         self.sys_wip = 0
         self.sys_wip_history: list[tuple[float, int]] = []
         # (event_ts, completions, scraps) — rates derived when building trend series
         self.sys_rate_history: list[tuple[float, int, int]] = []
+        # part_id -> time of its counted START (cycle time); kept after close, overwritten by the next.
         self.sys_start_time: dict[str, float] = {}
         self.num_completions = 0
         self.num_scraps = 0
@@ -278,9 +294,13 @@ class KpiCalculator:
         self.stage_departures: dict[int, int] = {s: 0 for s in range(1, 7)}
         self.stage_forced_exits: dict[int, int] = {s: 0 for s in range(1, 7)}
         self.stage_flow_times: dict[int, list[float]] = defaultdict(list)
+        # (part_id, stage) -> entry time; a formal exit turns it into a flow-time sample,
+        # a forced leave or lap close drops it.
         self.stage_entry_time: dict[tuple[str, int], float] = {}
+        # (splitter, part_id) -> last FORWARD / RETURN there; never cleared.
         self.last_splitter_mark: dict[tuple[str, str], str] = {}
-        # Stage4: at most one exit (splitter3 or splitter4 FORWARD→TRANSFER) per station41 LOAD per part
+        # part_id -> Stage4 exits still allowed: +1 per Stage4 entry LOAD, -1 per Stage4 exit or
+        # forced leave of Stage4, dropped at lap close (open question 1).
         self._s4_pending_exits: dict[str, int] = {}
         # part_id -> stage 1..6 they are in (in-model); at most one stage per part
         self._part_current_stage: dict[str, int] = {}
@@ -288,10 +308,14 @@ class KpiCalculator:
         self._part_transit_stage: dict[str, int] = {}
 
         # --- Station (BUSY / FAIL / BLOCKED / IDLE) ---
+        # station_id -> {"state", "start": when the current state began, "part": current part}
         self._stn_state: dict[str, dict[str, Any]] = {}
+        # station_id -> seconds spent in each state, up to "start" of the current state
         self._stn_acc: dict[str, dict[str, float]] = {}
+        # stations that received a state-machine activity; only these get real KPIs
         self._stn_touched: set[str] = set()
         self._distinct_part_ids: set[str] = set()
+        # FAIL events at KPI stations (whatever the station's state)
         self.fail_event_count = 0
 
         self._missing_part_warns_emitted = 0
@@ -305,10 +329,8 @@ class KpiCalculator:
         return self.num_completions
 
     def _warn_missing_part_id(self, event: dict) -> None:
-        if self._missing_part_warn_cap <= 0:
-            return
         if self._missing_part_warns_emitted >= self._missing_part_warn_cap:
-            return
+            return  # also when the cap is 0 (warnings off)
         self._missing_part_warns_emitted += 1
         print(
             "[KPI WARNING] missing part id (checked part_id, partId, entity_id, entityId): {}".format(
@@ -329,10 +351,8 @@ class KpiCalculator:
             (ts, self.num_completions, self.num_scraps)
         )
 
-    def _append_stage_wip(self, stage: int, ts: float) -> None:
-        self.stage_wip_hist[stage].append((ts, self.stage_wip[stage]))
-
     def _clear_part_stage_state(self, part_id: str) -> None:
+        """Lap closed: drop the part's stage state (no departures or flow-time samples)."""
         self._part_current_stage.pop(part_id, None)
         self._part_transit_stage.pop(part_id, None)
         self._s4_pending_exits.pop(part_id, None)
@@ -340,126 +360,84 @@ class KpiCalculator:
             del self.stage_entry_time[key]
 
     def _sync_stage_wip_at(self, ts: float) -> None:
-        """Derive stage WIP from open laps so sum(stage) == system WIP."""
+        """Derive stage WIP from open laps so sum(stage) == system WIP: each part counts in its
+        current stage, else its transit stage, else stage 1. History gets (ts, WIP) on change."""
         counts = {s: 0 for s in range(1, 7)}
-        for pid in self._open_lap:
-            cur = self._part_current_stage.get(pid)
-            if cur is not None:
-                counts[cur] += 1
-            elif pid in self._part_transit_stage:
-                counts[self._part_transit_stage[pid]] += 1
-            else:
-                counts[1] += 1
+        for part_id in self._open_lap:
+            stage = self._part_current_stage.get(part_id)
+            if stage is None:
+                stage = self._part_transit_stage.get(part_id, 1)
+            counts[stage] += 1
         for stage in range(1, 7):
             if self.stage_wip[stage] != counts[stage]:
                 self.stage_wip[stage] = counts[stage]
-                self._append_stage_wip(stage, ts)
+                self.stage_wip_hist[stage].append((ts, counts[stage]))
 
-    def _assign_transit_after_exit(self, stage: int, part_id: str) -> None:
-        if part_id not in self._open_lap:
-            return
-        if stage in (2, 4, 6):
-            self._part_transit_stage[part_id] = stage
-        else:
-            self._part_transit_stage[part_id] = min(6, stage + 1)
-
-    def _stage_force_leave_without_departure(self, stage: int, part_id: str, ts: float) -> None:
-        """Keep stage WIP sane when a part appears in another stage without a formal exit event.
-
-        This is a reconciliation path only: it must NOT increment departures/throughput or flow-time samples.
-        """
+    def _stage_force_leave_without_departure(self, stage: int, part_id: str) -> None:
+        """The part shows up in another stage without a formal exit from ``stage``: it leaves
+        for WIP only, with no departure or flow-time sample. Uses up one pending Stage4 exit."""
         self.stage_forced_exits[stage] += 1
-        key = (part_id, stage)
-        if key in self.stage_entry_time:
-            del self.stage_entry_time[key]
+        self.stage_entry_time.pop((part_id, stage), None)
         if stage == 4 and self._s4_pending_exits.get(part_id, 0) > 0:
             self._s4_pending_exits[part_id] -= 1
-        if part_id in self._part_current_stage and self._part_current_stage[part_id] == stage:
-            del self._part_current_stage[part_id]
+        del self._part_current_stage[part_id]  # ``stage`` is the part's current stage
 
     def _stage_entry(self, stage: int, part_id: str, ts: float) -> None:
-        if not part_id:
-            return
-        cur = self._part_current_stage.get(part_id)
-        if cur == stage:
-            if stage in (2, 4, 6):
-                # Looping stage: repeated LOAD counts as a completed pass.
-                self._stage_exit(stage, part_id, ts)
-            else:
+        """LOAD at an anchor station of ``stage``.
+
+        Repeated LOAD in the same stage: a looping stage first closes the previous pass as a
+        formal exit; stages 1, 3, 5 ignore it. LOAD in another stage: the part first leaves its
+        current stage without a departure.
+        """
+        current_stage = self._part_current_stage.get(part_id)
+        if current_stage == stage:
+            if stage not in _LOOPING_STAGES:
                 return
-        if cur is not None and cur != stage:
-            self._stage_force_leave_without_departure(cur, part_id, ts)
-        if part_id in self._part_current_stage and self._part_current_stage[part_id] != stage:
-            del self._part_current_stage[part_id]
+            self._stage_exit(stage, part_id, ts)
+        elif current_stage is not None:
+            self._stage_force_leave_without_departure(current_stage, part_id)
         self._part_transit_stage.pop(part_id, None)
         self._part_current_stage[part_id] = stage
         self.stage_entry_time[(part_id, stage)] = ts
-        if stage == 4 and part_id:
+        if stage == 4:
             self._s4_pending_exits[part_id] = self._s4_pending_exits.get(part_id, 0) + 1
 
-    def _stage4_exit_dedup(self, part_id: str, ts: float) -> None:
-        """One Stage4 exit per `station41` LOAD: ignore extra FORWARD+TRANSFER on splitter3/4 same lap."""
-        if not part_id:
-            return
-        if self._s4_pending_exits.get(part_id, 0) <= 0:
-            return
-        self._s4_pending_exits[part_id] -= 1
-        self._stage_exit(4, part_id, ts)
-
     def _stage_exit(self, stage: int, part_id: str, ts: float) -> None:
-        if not part_id:
-            return
-        key = (part_id, stage)
-        if key in self.stage_entry_time:
-            self.stage_flow_times[stage].append(ts - self.stage_entry_time[key])
-            del self.stage_entry_time[key]
+        """Formal exit of ``stage``: a departure and flow-time sample only if the entry is on
+        record. An open-lap part then counts in the next stage until its next entry; after a
+        looping stage it stays in the same stage (open question 2)."""
+        entry_ts = self.stage_entry_time.pop((part_id, stage), None)
+        if entry_ts is not None:
+            self.stage_flow_times[stage].append(ts - entry_ts)
             self.stage_departures[stage] += 1
-        if part_id in self._part_current_stage and self._part_current_stage[part_id] == stage:
+        if self._part_current_stage.get(part_id) == stage:
             del self._part_current_stage[part_id]
-        self._assign_transit_after_exit(stage, part_id)
+        if part_id in self._open_lap:
+            self._part_transit_stage[part_id] = stage if stage in _LOOPING_STAGES else min(6, stage + 1)
 
-    def _stage_exit_on_event(self, comp: str, act_u: str, part_id: str, ts: float) -> None:
-        """Formal stage exits.
-
-        Stations / corner1: TRANSFER exits the stage directly.
-        splitter1 (stage 2) and splitter3/4 (stage 4): FORWARD/RETURN is remembered per part,
-        and a later TRANSFER exits only if the last mark was FORWARD (not RETURN).
-        """
-        if comp in _FORWARD_EXIT_SPLITTERS:
-            if act_u in _SPLITTER_MARK_ACTS:
-                self.last_splitter_mark[(comp, part_id)] = act_u
-            elif act_u == "TRANSFER" and self.last_splitter_mark.get((comp, part_id)) == "FORWARD":
-                if comp == "splitter1":
+    def _stage_exit_on_event(self, component_id: str, activity: str, part_id: str, ts: float) -> None:
+        """Formal stage exits: TRANSFER at a station / corner1, or TRANSFER at a splitter whose
+        last mark for the part is FORWARD (not RETURN)."""
+        if component_id in _FORWARD_EXIT_SPLITTERS:
+            if activity in _SPLITTER_MARK_ACTS:
+                self.last_splitter_mark[(component_id, part_id)] = activity
+            elif activity == "TRANSFER" and self.last_splitter_mark.get((component_id, part_id)) == "FORWARD":
+                if component_id == "splitter1":
                     self._stage_exit(2, part_id, ts)
-                else:
-                    self._stage4_exit_dedup(part_id, ts)
-        elif act_u == "TRANSFER" and comp in _TRANSFER_EXIT_STAGE:
-            self._stage_exit(_TRANSFER_EXIT_STAGE[comp], part_id, ts)
+                elif self._s4_pending_exits.get(part_id, 0) > 0:
+                    # splitter3 / splitter4: one Stage4 exit per pending entry, so the other
+                    # splitter in the same pass does not exit again (open question 1).
+                    self._s4_pending_exits[part_id] -= 1
+                    self._stage_exit(4, part_id, ts)
+        elif activity == "TRANSFER" and component_id in _TRANSFER_EXIT_STAGE:
+            self._stage_exit(_TRANSFER_EXIT_STAGE[component_id], part_id, ts)
 
-    def _stn_ensure(self, sid: str, ts: float) -> None:
-        if sid not in self._stn_state:
-            self._stn_state[sid] = {
-                "state": "IDLE",
-                "start": ts,
-                "part": "",
-            }
-            self._stn_acc[sid] = {
-                "BUSY": 0.0,
-                "FAIL": 0.0,
-                "BLOCKED": 0.0,
-                "IDLE": 0.0,
-            }
-
-    def _stn_elapse(self, sid: str, ts: float) -> None:
-        st = self._stn_state[sid]
-        dt = max(0.0, ts - float(st["start"]))
-        self._stn_acc[sid][str(st["state"])] += dt
-        st["start"] = ts
-
-    def _stn_set_state(self, sid: str, new_state: str, ts: float) -> None:
-        self._stn_ensure(sid, ts)
-        self._stn_elapse(sid, ts)
-        self._stn_state[sid]["state"] = new_state
+    def _set_station_state(self, station_id: str, new_state: str, ts: float) -> None:
+        """Book the time since the current state began (a late ``ts`` adds nothing), then switch."""
+        station = self._stn_state[station_id]
+        self._stn_acc[station_id][station["state"]] += max(0.0, ts - station["start"])
+        station["state"] = new_state
+        station["start"] = ts
 
     def _open_lap_on_start(self, part_id: str, ts: float) -> None:
         """corner2 START: open a lap (system WIP +1); a part already in an open lap is not recounted."""
@@ -486,7 +464,7 @@ class KpiCalculator:
         self._append_sys_wip(ts)
         self.sys_start_time[part_id] = ts
 
-    def _close_lap(self, part_id: str, ts: float, act_u: str, *, finished: bool) -> None:
+    def _close_lap(self, part_id: str, ts: float, activity: str, *, finished: bool) -> None:
         """splitter5 FINISH (``finished``) or SCRAP: close the open lap (system WIP -1).
 
         Counts the completion/scrap and its cycle time from the lap's START.
@@ -510,101 +488,96 @@ class KpiCalculator:
         if _kpi_wip_debug_enabled():
             print(
                 f"[KPI WIP-1 {'FINISH' if finished else 'SCRAP'}] part_id={part_id!r} "
-                f"had_open={had_open} wip {wip_before}->{self.sys_wip} act={act_u!r}",
+                f"had_open={had_open} wip {wip_before}->{self.sys_wip} act={activity!r}",
                 flush=True,
             )
 
-    def _update_station_state(self, sid: str, act_u: str, part_id: str, ts: float) -> None:
-        """Station state machine; other activities leave the station untouched.
+    def _update_station_state(self, station_id: str, activity: str, part_id: str, ts: float) -> None:
+        """Station state machine; other activities, and PASS without a part, are ignored.
 
-        LOAD -> BUSY; FAIL while BUSY -> FAIL; UNLOAD or BLOCK while BUSY/FAIL -> BLOCKED;
-        TRANSFER while BLOCKED -> IDLE (part cleared); PASS only records the current part.
+        LOAD           any state     -> BUSY, current part = this part (if given)
+        FAIL           BUSY          -> FAIL (every FAIL is counted, whatever the state)
+        UNLOAD, BLOCK  BUSY or FAIL  -> BLOCKED (BLOCK: downstream blocked, not extended BUSY)
+        TRANSFER       BLOCKED       -> IDLE, current part cleared
+        PASS           any state     -> current part = this part
+        The station is reported (``_stn_touched``) even if its state does not change.
         """
-        if act_u == "FAIL":
+        if activity not in ("LOAD", "FAIL", "UNLOAD", "BLOCK", "TRANSFER", "PASS"):
+            return
+        if activity == "PASS" and not part_id:
+            return
+        if activity == "FAIL":
             self.fail_event_count += 1
-            self._stn_touched.add(sid)
-            self._stn_ensure(sid, ts)
-            if self._stn_state[sid]["state"] == "BUSY":
-                self._stn_set_state(sid, "FAIL", ts)
-        elif act_u == "LOAD":
-            self._stn_touched.add(sid)
-            self._stn_set_state(sid, "BUSY", ts)
+        self._stn_touched.add(station_id)
+        if station_id not in self._stn_state:  # first activity: IDLE from here
+            self._stn_state[station_id] = {"state": "IDLE", "start": ts, "part": ""}
+            self._stn_acc[station_id] = {"BUSY": 0.0, "FAIL": 0.0, "BLOCKED": 0.0, "IDLE": 0.0}
+        station = self._stn_state[station_id]
+        state = station["state"]
+
+        if activity == "LOAD":
+            self._set_station_state(station_id, "BUSY", ts)
             if part_id:
-                self._stn_state[sid]["part"] = part_id
-        elif act_u in ("UNLOAD", "BLOCK"):
-            # BLOCK: downstream blocked before UNLOAD -> BLOCKED (not extended BUSY).
-            self._stn_touched.add(sid)
-            self._stn_ensure(sid, ts)
-            if self._stn_state[sid]["state"] in ("BUSY", "FAIL"):
-                self._stn_set_state(sid, "BLOCKED", ts)
-        elif act_u == "TRANSFER":
-            self._stn_touched.add(sid)
-            self._stn_ensure(sid, ts)
-            if self._stn_state[sid]["state"] == "BLOCKED":
-                self._stn_set_state(sid, "IDLE", ts)
-                self._stn_state[sid]["part"] = ""
-        elif act_u == "PASS" and part_id:
-            self._stn_touched.add(sid)
-            self._stn_ensure(sid, ts)
-            self._stn_state[sid]["part"] = part_id
+                station["part"] = part_id
+        elif activity == "FAIL" and state == "BUSY":
+            self._set_station_state(station_id, "FAIL", ts)
+        elif activity in ("UNLOAD", "BLOCK") and state in ("BUSY", "FAIL"):
+            self._set_station_state(station_id, "BLOCKED", ts)
+        elif activity == "TRANSFER" and state == "BLOCKED":
+            self._set_station_state(station_id, "IDLE", ts)
+            station["part"] = ""
+        elif activity == "PASS":
+            station["part"] = part_id
 
     def on_event(self, event: dict) -> None:
-        time_str = event.get("time")
-        if not time_str:
+        """Apply one component event (events without a "time" are ignored)."""
+        raw_time = event.get("time")
+        if not raw_time:
             return
-        ts = _parse_ts(str(time_str))
-        comp = str(event.get("component_id", "") or "").strip()
+        ts = _parse_ts(str(raw_time))
+        component_id = str(event.get("component_id", "") or "").strip()
         part_id = _extract_part_id(event)
-        act_u = str(event.get("activity", "") or "").strip().upper()
+        activity = str(event.get("activity", "") or "").strip().upper()
 
-        if not part_id and act_u in (
-            "START",
-            "FINISH",
-            "LOAD",
-            "UNLOAD",
-            "TRANSFER",
-            "SCRAP",
-            "FAIL",
-        ):
+        if not part_id and activity in _ACTIVITIES_NEEDING_PART_ID:
             self._warn_missing_part_id(event)
 
         if self.observation_start_ts is None:
             self.observation_start_ts = ts
-        self.last_event_ts = ts
+        self.last_event_ts = ts  # the latest *received*, not the latest timestamp
 
         if part_id:
             self._distinct_part_ids.add(part_id)
 
         # -------- System WIP (only these branches mutate sys_wip) --------
-        if _kpi_wip_debug_enabled() and comp in ("corner2", "splitter5"):
+        if _kpi_wip_debug_enabled() and component_id in ("corner2", "splitter5"):
             print(
-                f"[WIP] {comp} {act_u} | wip before={self.sys_wip}",
+                f"[WIP] {component_id} {activity} | wip before={self.sys_wip}",
                 flush=True,
             )
 
-        if comp == "corner2" and act_u == "START" and part_id:
+        if component_id == "corner2" and activity == "START" and part_id:
             self._open_lap_on_start(part_id, ts)
 
-        # splitter5 CHECKOUT is a hardware pre-signal (FINISH/SCRAP follow) and is ignored.
-        # An activity listed in both finish_events and scrap_events is applied as FINISH first;
-        # the SCRAP pass then finds the lap already closed.
-        if comp == "splitter5" and part_id:
-            if act_u in self._finish_upper:
-                self._close_lap(part_id, ts, act_u, finished=True)
-            if act_u in self._scrap_upper:
-                self._close_lap(part_id, ts, act_u, finished=False)
+        # CHECKOUT (pre-signal) is ignored. An activity configured as both FINISH and SCRAP
+        # closes the lap as FINISH; the SCRAP pass then finds no open lap.
+        if component_id == "splitter5" and part_id:
+            if activity in self._finish_upper:
+                self._close_lap(part_id, ts, activity, finished=True)
+            if activity in self._scrap_upper:
+                self._close_lap(part_id, ts, activity, finished=False)
 
         # -------- Stage entry (LOAD @ anchors) --------
-        if act_u == "LOAD" and comp in STAGE_ENTRY and part_id:
-            self._stage_entry(STAGE_ENTRY[comp], part_id, ts)
+        if activity == "LOAD" and component_id in STAGE_ENTRY and part_id:
+            self._stage_entry(STAGE_ENTRY[component_id], part_id, ts)
 
         # -------- Stage exits --------
         if part_id:
-            self._stage_exit_on_event(comp, act_u, part_id, ts)
+            self._stage_exit_on_event(component_id, activity, part_id, ts)
 
         # -------- Station BUSY / FAIL / BLOCKED / IDLE --------
-        if comp in STATION_KPI_IDS:
-            self._update_station_state(comp, act_u, part_id, ts)
+        if component_id in STATION_KPI_IDS:
+            self._update_station_state(component_id, activity, part_id, ts)
 
         self._sync_stage_wip_at(ts)
 
@@ -641,9 +614,9 @@ class KpiCalculator:
     ) -> tuple[dict[str, float], dict[str, dict[str, float]], dict[str, dict[str, str]]]:
         """Per station: utilization, state probabilities and live state.
 
-        Shares are over the time since the station's first state event (not the whole
-        observation window); the current state's open interval counts up to
-        ``observation_end_ts``. utilization = busy + fail share, clamped to 0..1.
+        Shares are over the time since the station's first state event (open question 4); the
+        current state's open interval counts up to ``observation_end_ts``. utilization = busy +
+        fail share, clamped to 0..1.
         All shares are rounded to 4 decimals. A station without any state event reports
         idle = 1.0; so does one whose tracked time is still zero.
         """
@@ -651,24 +624,24 @@ class KpiCalculator:
         state_probability: dict[str, dict[str, float]] = {}
         station_live: dict[str, dict[str, str]] = {}
 
-        for sid in sorted(STATION_KPI_IDS):
-            if sid not in self._stn_touched or sid not in self._stn_state:
-                utilization[sid] = 0.0
-                state_probability[sid] = {
+        for station_id in sorted(STATION_KPI_IDS):
+            if station_id not in self._stn_touched or station_id not in self._stn_state:
+                utilization[station_id] = 0.0
+                state_probability[station_id] = {
                     "busy": 0.0,
                     "fail": 0.0,
                     "blocked": 0.0,
                     "idle": 1.0,
                 }
-                station_live[sid] = {
+                station_live[station_id] = {
                     "current_state": "IDLE",
                     "current_part_id": "",
                     "queue_hint": "",
                 }
                 continue
 
-            station = self._stn_state[sid]
-            seconds_in_state = dict(self._stn_acc[sid])  # copy: the open interval is not stored
+            station = self._stn_state[station_id]
+            seconds_in_state = dict(self._stn_acc[station_id])  # copy: the open interval is not stored
             current_state = str(station["state"])
             open_interval = max(0.0, observation_end_ts - float(station["start"]))
             seconds_in_state[current_state] = seconds_in_state.get(current_state, 0.0) + open_interval
@@ -688,14 +661,14 @@ class KpiCalculator:
                 blocked_share = seconds_in_state.get("BLOCKED", 0.0) / tracked_seconds
                 idle_share = seconds_in_state.get("IDLE", 0.0) / tracked_seconds
 
-            utilization[sid] = round(max(0.0, min(1.0, busy_share + fail_share)), 4)
-            state_probability[sid] = {
+            utilization[station_id] = round(max(0.0, min(1.0, busy_share + fail_share)), 4)
+            state_probability[station_id] = {
                 "busy": round(busy_share, 4),
                 "fail": round(fail_share, 4),
                 "blocked": round(blocked_share, 4),
                 "idle": round(idle_share, 4),
             }
-            station_live[sid] = {
+            station_live[station_id] = {
                 "current_state": current_state,
                 "current_part_id": str(station.get("part") or "").strip(),
                 "queue_hint": "",
@@ -708,8 +681,7 @@ class KpiCalculator:
         replay: the last event's time; the wall clock only while there is no event yet.
         realtime: now, unless the last event is more than ``_REALTIME_STALE_AFTER_SEC`` old;
         then the window ends at the last event. So once events stop, rates and averages keep
-        decreasing for 30 s and then jump back to their value at the last event. (Why 30 s,
-        and why this switch, is not documented: to be confirmed.)
+        decreasing for 30 s and then jump back to their value at the last event (open question 3).
         """
         if self.observation_time_mode == "replay":
             return float(self.last_event_ts) if self.last_event_ts is not None else datetime.datetime.now().timestamp()
