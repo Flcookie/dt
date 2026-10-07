@@ -17,6 +17,7 @@ tests = [
     # test_kpi_calculator.py.
     ("event pipeline / buffer", ["test_event_pipeline.py", "test_event_buffer.py"]),
     ("main_service", ["test_main_service.py"]),
+    ("neo4j_writer (fake driver)", ["test_neo4j_writer.py"]),
     ("KPI calculator", ["test_kpi_calculator.py"]),
     ("process stages", ["test_process_stages.py"]),
     ("replay scripts", ["test_replay_direct.py"]),

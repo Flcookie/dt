@@ -1,11 +1,20 @@
 from neo4j import GraphDatabase
 import uuid
-import json
 import datetime
 
 import common
 
 # neo4j_writer - write events to graph DB, credentials from config + env
+#
+# Open questions (behaviour kept as is, not fixed):
+#   1. A driver retry of write_events_batch's transaction reuses the chain copies the failed
+#      attempt already advanced, so it can link an event to itself or to a later event.
+#   2. Events with an empty part id are chained as one part (Entity sysId "").
+#   3. activity is stripped but keeps its case ("Load" and "LOAD" are different Activity
+#      nodes); DF_PROCESS compares upper-cased names.
+#   4. A bad time string (ValueError) or a converted event missing a field (KeyError) fails
+#      the whole batch; callers only log it.
+#   5. NEXT continues from the last event written, also when a batch names another session.
 _config = common.load_config("config.json")
 _neo4j_cfg = _config["neo4j"]
 NEO4J_URI = _neo4j_cfg["uri"]
@@ -70,7 +79,7 @@ def start_session(
     Session nodes store only ``id``, ``start_time``, and ``end_time``. Other parameters are
     ignored (kept for call-site compatibility).
     """
-    global _last_event_per_part, _last_process_event_per_part, _last_global_event_id, _current_session_id
+    global _last_global_event_id, _current_session_id
     _ = (description, event_count, source_file, status, display_name)
     _current_session_id = session_id
     _last_event_per_part.clear()
@@ -132,20 +141,36 @@ def _finalize_session_tx(tx, session_id: str, end_time_iso: str):
     )
 
 
-def _to_neo4j_format(event: dict) -> dict | None:
-    """Convert physical event (time/component_id) to neo4j format (timestamp/station_id)."""
-    time_str = event.get("time")
-    if not time_str:
-        return None
-    ts = datetime.datetime.fromisoformat(str(time_str).strip()).timestamp()
-    return {
-        "timestamp": ts,
-        "station_id": str(event.get("component_id", "") or "").strip(),
-        "time_str": str(time_str).strip(),
-        "part_id": str(event.get("part_id", "") or "").strip(),
-        "part_type": event.get("part_type", "part"),
-        "activity": str(event.get("activity", "") or "").strip(),
-    }
+def _event_write_fields(event: dict) -> dict | None:
+    """Fields written for one event: timestamp, time_str, station_id, part_id, part_type, activity.
+
+    A physical event (``time`` but no ``timestamp``) is converted; without a time value it is
+    skipped (None). Any other event is taken as already converted: it is copied, and
+    ``time_str`` / ``station_id`` are filled in from ``time`` / ``timestamp`` / ``component_id``
+    when missing.
+    """
+    if "time" in event and "timestamp" not in event:
+        time_str = event.get("time")
+        if not time_str:
+            return None
+        time_str = str(time_str).strip()
+        return {
+            "timestamp": datetime.datetime.fromisoformat(time_str).timestamp(),
+            "station_id": str(event.get("component_id", "") or "").strip(),
+            "time_str": time_str,
+            "part_id": str(event.get("part_id", "") or "").strip(),
+            "part_type": event.get("part_type", "part"),
+            "activity": str(event.get("activity", "") or "").strip(),
+        }
+    fields = dict(event)
+    if not fields.get("time_str"):
+        if fields.get("time"):
+            fields["time_str"] = str(fields["time"]).strip()
+        elif fields.get("timestamp") is not None:
+            fields["time_str"] = datetime.datetime.fromtimestamp(float(fields["timestamp"])).isoformat()
+    if "station_id" not in fields and fields.get("component_id") is not None:
+        fields["station_id"] = str(fields["component_id"]).strip()
+    return fields
 
 
 def write_event_to_graph(event: dict, session_id: str | None = None):
@@ -154,70 +179,69 @@ def write_event_to_graph(event: dict, session_id: str | None = None):
 
 
 def write_events_batch(events: list, session_id: str | None = None):
-    """Write multiple events in one transaction. More efficient than one-by-one."""
+    """Write the events in one transaction, in list order; events without a time are skipped.
+
+    Each event gets a new uuid4 ``Event.id``. The DF / DF_PROCESS / NEXT chains continue from
+    earlier batches (module state, updated only after the transaction succeeded).
+    """
     global _last_global_event_id, _last_process_event_per_part
     sid = session_id or _current_session_id
     if not sid or not events:
         return
     prepared = []
-    for ev in events:
-        if "time" in ev and "timestamp" not in ev:
-            e = _to_neo4j_format(ev)
-        else:
-            e = dict(ev)
-            if not e.get("time_str"):
-                if e.get("time"):
-                    e["time_str"] = str(e["time"]).strip()
-                elif e.get("timestamp") is not None:
-                    e["time_str"] = datetime.datetime.fromtimestamp(
-                        float(e["timestamp"])
-                    ).isoformat()
-            if "station_id" not in e and e.get("component_id") is not None:
-                e["station_id"] = str(e["component_id"]).strip()
-        if e is None:
-            continue
-        prepared.append((str(uuid.uuid4()), e))
+    for event in events:
+        fields = _event_write_fields(event)
+        if fields is not None:
+            prepared.append((str(uuid.uuid4()), fields))
     if not prepared:
         return
-    last_part = dict(_last_event_per_part)
-    last_proc = dict(_last_process_event_per_part)
-    last_global = _last_global_event_id
-    df_acts = _df_process_activities_list() if _df_process_on_write_enabled() else None
-    st_df, ent_df = _station_entity_df_flags()
+    if _df_process_on_write_enabled():
+        process_activities = frozenset(_df_process_activities_list())
+    else:
+        process_activities = frozenset()
+    station_df, entity_df = _station_entity_df_flags()
+    # The transaction function advances these copies; the module state takes them over only
+    # after the write succeeded. A driver retry reuses the same copies (open question 1).
+    last_event_per_part = dict(_last_event_per_part)
+    last_process_event_per_part = dict(_last_process_event_per_part)
     with driver.session() as session:
         session.execute_write(
             _write_batch_tx,
             sid,
             prepared,
-            last_part,
-            last_global,
-            df_acts,
-            last_proc,
-            st_df,
-            ent_df,
+            last_event_per_part,
+            _last_global_event_id,
+            process_activities,
+            last_process_event_per_part,
+            station_df,
+            entity_df,
         )
-    for eid, e in prepared:
-        _last_event_per_part[e["part_id"]] = eid
-        _last_global_event_id = eid
-    _last_process_event_per_part = last_proc
+    for event_id, fields in prepared:
+        _last_event_per_part[fields["part_id"]] = event_id
+    _last_global_event_id = prepared[-1][0]
+    _last_process_event_per_part = last_process_event_per_part
 
 
 def _write_batch_tx(
     tx,
     session_id: str,
     prepared: list,
-    last_part: dict,
-    last_global: str | None,
-    df_process_acts: list | None,
-    last_proc: dict,
+    last_event_per_part: dict,
+    last_event_id: str | None,
+    process_activities: frozenset,
+    last_process_event_per_part: dict,
     station_df_on_write: bool,
     entity_df_on_write: bool,
 ):
-    """Event DF / DF_PROCESS; optional Station–Station DF / DF_PROCESS; Entity–Entity DF on global chain.
+    """Per event, in order: the Event node and its links, then the chains to earlier events.
 
-    NEXT links consecutive events by ingestion/write order (system timeline), not causal dependency between parts.
+    - DF: consecutive events of the same part (any activity); optionally Station DF between
+      their stations.
+    - DF_PROCESS: like DF, but only over events whose activity is in ``process_activities``
+      (TRANSFER, BLOCK, ... skipped); optionally Station DF_PROCESS.
+    - NEXT: consecutive events in write order (system timeline, not causal dependency between
+      parts); optionally Entity DF between the two parts when they differ.
     """
-    act_set = frozenset(df_process_acts) if df_process_acts else None
     for event_id, event in prepared:
         tx.run(
             """
@@ -249,11 +273,11 @@ def _write_batch_tx(
             activity=event["activity"],
         )
         part_id = event["part_id"]
-        prev_part = last_part.get(part_id)
-        if prev_part:
+        prev_event_id = last_event_per_part.get(part_id)
+        if prev_event_id:
             tx.run(
                 "MATCH (e1:Event {id: $p}) MATCH (e2:Event {id: $c}) MERGE (e1)-[:DF]->(e2)",
-                p=prev_part, c=event_id,
+                p=prev_event_id, c=event_id,
             )
             if station_df_on_write:
                 tx.run(
@@ -262,17 +286,15 @@ def _write_batch_tx(
                     MATCH (e2:Event {id: $c})-[:OCCURRED_AT]->(s2:Station)
                     MERGE (s1)-[:DF]->(s2)
                     """,
-                    p=prev_part,
-                    c=event_id,
+                    p=prev_event_id, c=event_id,
                 )
-        act_u = str(event.get("activity") or "").strip().upper()
-        if act_set and act_u in act_set:
-            prev_pe = last_proc.get(part_id)
-            if prev_pe:
+        activity = str(event.get("activity") or "").strip().upper()
+        if activity in process_activities:
+            prev_process_event_id = last_process_event_per_part.get(part_id)
+            if prev_process_event_id:
                 tx.run(
                     "MATCH (e1:Event {id: $p}) MATCH (e2:Event {id: $c}) MERGE (e1)-[:DF_PROCESS]->(e2)",
-                    p=prev_pe,
-                    c=event_id,
+                    p=prev_process_event_id, c=event_id,
                 )
                 if station_df_on_write:
                     tx.run(
@@ -281,16 +303,15 @@ def _write_batch_tx(
                         MATCH (e2:Event {id: $c})-[:OCCURRED_AT]->(s2:Station)
                         MERGE (s1)-[:DF_PROCESS]->(s2)
                         """,
-                        p=prev_pe,
-                        c=event_id,
+                        p=prev_process_event_id, c=event_id,
                     )
-            last_proc[part_id] = event_id
+            last_process_event_per_part[part_id] = event_id
+        last_event_per_part[part_id] = event_id
 
-        last_part[part_id] = event_id
-        if last_global:
+        if last_event_id:
             tx.run(
                 "MATCH (e1:Event {id: $p}) MATCH (e2:Event {id: $c}) MERGE (e1)-[:NEXT]->(e2)",
-                p=last_global, c=event_id,
+                p=last_event_id, c=event_id,
             )
             if entity_df_on_write:
                 tx.run(
@@ -300,15 +321,14 @@ def _write_batch_tx(
                     WHERE en1.sysId <> en2.sysId
                     MERGE (en1)-[:DF]->(en2)
                     """,
-                    p=last_global,
-                    c=event_id,
+                    p=last_event_id, c=event_id,
                 )
-        last_global = event_id
+        last_event_id = event_id
 
 
 def clear_all_events() -> None:
     """Delete all Event and Session nodes and reset internal state."""
-    global _last_event_per_part, _last_process_event_per_part, _last_global_event_id, _current_session_id
+    global _last_global_event_id, _current_session_id
     with driver.session() as session:
         session.execute_write(_delete_all_events_tx)
     _last_event_per_part.clear()
