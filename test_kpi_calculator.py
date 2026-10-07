@@ -805,3 +805,101 @@ if __name__ == "__main__":
     test_station_live_busy_transfer()
     test_station_live_pass()
     print("All KPI tests passed.")
+
+
+# ---- get_snapshot: observation window, clock reads, trend cut-offs (expected values by hand) ----
+
+import datetime as _dt  # noqa: E402
+import types as _types  # noqa: E402
+
+_T0 = _dt.datetime(2026, 3, 12, 18, 0, 0)
+
+
+def _iso(seconds):
+    return (_T0 + _dt.timedelta(seconds=seconds)).isoformat(timespec="milliseconds")
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """kpi_calculator.datetime.now() returns ``clock.now`` (seconds after _T0) and is counted."""
+    state = _types.SimpleNamespace(now=0.0, calls=0)
+
+    class _Clock(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            state.calls += 1
+            return _T0 + _dt.timedelta(seconds=state.now)
+
+    monkeypatch.setattr(kpi_calculator, "datetime", _types.SimpleNamespace(datetime=_Clock))
+    return state
+
+
+def _start_finish(kpi, part, start_s, finish_s, act="FINISH"):
+    kpi.on_event({"time": _iso(start_s), "component_id": "corner2", "part_id": part, "activity": "START"})
+    kpi.on_event({"time": _iso(finish_s), "component_id": "splitter5", "part_id": part, "activity": act})
+
+
+def test_realtime_window_ends_now_until_30s_after_the_last_event(clock):
+    kpi = kpi_calculator.KpiCalculator(observation_time_mode="realtime")
+    _start_finish(kpi, "p1", 0, 10)  # first event at 0 s, last at 10 s
+    for now, obs, rate in ((15.0, 15.0, 0.0667), (40.0, 40.0, 0.025), (40.0001, 10.0, 0.1), (40.5, 10.0, 0.1)):
+        clock.now = now  # 40.0 is exactly 30 s after the last event: still "now"; 40.0001 is past it
+        s = kpi.get_snapshot()
+        assert (s["observation_time_sec"], s["complete_rate"]) == (obs, rate), now
+
+
+def test_replay_window_ends_at_the_last_event_whatever_the_clock(clock):
+    kpi = kpi_calculator.KpiCalculator(observation_time_mode="replay")
+    _start_finish(kpi, "p1", 0, 10)
+    clock.now = 5000.0
+    s = kpi.get_snapshot()
+    assert (s["observation_time_sec"], s["complete_rate"], clock.calls) == (10.0, 0.1, 0)
+
+
+def test_clock_reads_per_snapshot(clock):
+    clock.now = 7.0
+    empty = kpi_calculator.KpiCalculator(observation_time_mode="realtime")
+    s = empty.get_snapshot()
+    assert clock.calls == 2  # window end + chart time
+    assert s["observation_time_sec"] == 0.0 and s["complete_rate"] == 0.0  # minimum window 0.001 s
+    assert s["chart_time_unix"] == (_T0 + _dt.timedelta(seconds=7)).timestamp()
+    live = kpi_calculator.KpiCalculator(observation_time_mode="realtime")
+    _start_finish(live, "p1", 0, 5)
+    clock.calls = 0
+    live.get_snapshot()
+    assert clock.calls == 1  # window end only; chart time is the last event
+
+
+def test_scrap_rate_is_a_share_of_departures_and_complete_rate_is_per_second(clock):
+    kpi = kpi_calculator.KpiCalculator(observation_time_mode="replay")
+    _start_finish(kpi, "p1", 0, 5)
+    _start_finish(kpi, "p2", 6, 10)
+    _start_finish(kpi, "p3", 11, 15, act="SCRAP")
+    _start_finish(kpi, "p4", 16, 21)
+    s = kpi.get_snapshot()
+    assert s["complete_rate"] == s["throughput"] == 0.1429  # 3 completions / 21 s
+    assert s["scrap_rate"] == s["system"]["scrap_rate"] == 0.25  # 1 of 4 departed
+    assert s["yield_rate"] == 0.75
+    assert s["avg_cycle_time_finished_sec"] == 4.7 and s["avg_cycle_time_all_sec"] == 4.5  # (5+4+5)/3, (5+4+4+5)/4
+
+
+def test_trend_series_keep_only_the_most_recent_entries(clock):
+    kpi = kpi_calculator.KpiCalculator(observation_time_mode="replay")
+    for k in range(1005):  # part k: START at 3k s, FINISH 1.0-1.9 s later
+        _start_finish(kpi, "p%d" % k, 3 * k, 3 * k + 1 + (k % 10) / 10)
+    s = kpi.get_snapshot()
+    # 2010 WIP / departure entries -> the last 200 start with part 905's START
+    assert len(s["trend_sys_wip_history"]) == len(s["trend_departure_history"]) == 200
+    t905 = (_T0 + _dt.timedelta(seconds=3 * 905)).timestamp()
+    assert s["trend_sys_wip_history"][0] == [t905, 1]
+    assert s["trend_departure_history"][0] == [t905, 905, 0]
+    # 1005 finished cycle times -> the last 1000 (parts 5..1004)
+    cycles = s["trend_finished_cycle_times"]
+    assert len(cycles) == 1000 and cycles[0] == 1.5 and cycles[-1] == 1.4
+
+
+def test_repeated_snapshot_without_new_events_is_unchanged(clock):
+    kpi = kpi_calculator.KpiCalculator(observation_time_mode="replay")
+    _start_finish(kpi, "p1", 0, 10)
+    kpi.on_event({"time": _iso(12), "component_id": "station11", "part_id": "p2", "activity": "LOAD"})
+    assert kpi.get_snapshot() == kpi.get_snapshot()

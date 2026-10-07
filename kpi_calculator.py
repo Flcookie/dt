@@ -95,101 +95,128 @@ def _extract_part_id(event: dict | None) -> str:
     ).strip()
 
 
-def _wip_average_confirmed(
-    history: list[tuple[float, int]], observation_time: float, end_ts: float
+def _time_weighted_average_wip(
+    wip_history: list[tuple[float, int]], observation_seconds: float, observation_end_ts: float
 ) -> float:
-    """Time-weighted average WIP with tail carry to ``end_ts``."""
-    if not history or observation_time <= 0:
+    """Average WIP over the observation window, weighted by how long each WIP value held.
+
+    ``wip_history`` holds (time of change, WIP after the change). Each value counts until the
+    next change; the last one until ``observation_end_ts``. Negative spans count as 0. The sum
+    is divided by the whole observation window (from the first event), so time before the
+    first recorded change contributes WIP 0.
+    """
+    if not wip_history or observation_seconds <= 0:
         return 0.0
-    total = 0.0
-    for i in range(len(history) - 1):
-        t0, w = history[i]
-        t1, _ = history[i + 1]
-        total += float(w) * max(0.0, t1 - t0)
-    last_t, last_w = history[-1]
-    total += float(last_w) * max(0.0, end_ts - last_t)
-    return total / observation_time
+    wip_seconds = 0.0
+    for i in range(len(wip_history) - 1):
+        change_ts, wip = wip_history[i]
+        next_change_ts, _ = wip_history[i + 1]
+        wip_seconds += float(wip) * max(0.0, next_change_ts - change_ts)
+    last_change_ts, last_wip = wip_history[-1]
+    wip_seconds += float(last_wip) * max(0.0, observation_end_ts - last_change_ts)
+    return wip_seconds / observation_seconds
 
 
-# Trend chart: rolling yield among last N departures (FINISH/SCRAP), not lifetime cumulative.
+# Trend charts look at the most recent departures (FINISH or SCRAP), not lifetime totals.
 TREND_ROLLING_DEPARTURES = 20
+# Trend series use only the most recent history entries / finished cycle times.
+_TREND_HISTORY_POINTS = 200
+_TREND_CYCLE_TIME_SAMPLES = 1000
+# Realtime observation window: see KpiCalculator._observation_end_ts.
+_REALTIME_STALE_AFTER_SEC = 30.0
 
 
-def _rolling_departure_rates(
-    rate_history: list[tuple[float, int, int]],
+def _rolling_departure_shares_pct(
+    departure_history: list[tuple[float, int, int]],
     *,
     window: int = TREND_ROLLING_DEPARTURES,
 ) -> list[tuple[float, float, float]]:
-    """(ts, completion_pct, scrap_pct) over the last ``window`` departures ending at each point."""
-    if not rate_history or window <= 0:
+    """(ts, completion %, scrap %) of the recent departures, at every history point.
+
+    ``departure_history`` holds (ts, cumulative completions, cumulative scraps). From each
+    point the window reaches back until it holds at least ``window`` departures (or the start
+    of the given history); points whose window holds no departure are left out.
+    Percentages are rounded to 2 decimals.
+    """
+    if not departure_history or window <= 0:
         return []
     out: list[tuple[float, float, float]] = []
-    for i in range(len(rate_history)):
-        ts, nc, ns = rate_history[i]
-        j = i
-        dep_in_window = 0
-        while j > 0 and dep_in_window < window:
-            j -= 1
-            dep_in_window += (rate_history[j + 1][1] - rate_history[j][1]) + (
-                rate_history[j + 1][2] - rate_history[j][2]
-            )
-        c0, s0 = rate_history[j][1], rate_history[j][2]
-        d_comp = int(nc) - int(c0)
-        d_scrap = int(ns) - int(s0)
-        departed = d_comp + d_scrap
-        if departed <= 0:
+    for i in range(len(departure_history)):
+        ts, completions, scraps = departure_history[i]
+        window_start = i
+        departures_in_window = 0
+        while window_start > 0 and departures_in_window < window:
+            window_start -= 1
+            departures_in_window += (
+                departure_history[window_start + 1][1] - departure_history[window_start][1]
+            ) + (departure_history[window_start + 1][2] - departure_history[window_start][2])
+        completions_at_start = departure_history[window_start][1]
+        scraps_at_start = departure_history[window_start][2]
+        window_completions = int(completions) - int(completions_at_start)
+        window_scraps = int(scraps) - int(scraps_at_start)
+        window_departures = window_completions + window_scraps
+        if window_departures <= 0:
             continue
-        comp_pct = round(100.0 * d_comp / departed, 2)
-        scrap_pct = round(100.0 * d_scrap / departed, 2)
-        out.append((float(ts), comp_pct, scrap_pct))
+        completion_pct = round(100.0 * window_completions / window_departures, 2)
+        scrap_pct = round(100.0 * window_scraps / window_departures, 2)
+        out.append((float(ts), completion_pct, scrap_pct))
     return out
 
 
-def _rolling_departure_throughput_rates(
-    rate_history: list[tuple[float, int, int]],
+def _rolling_departure_rates_per_sec(
+    departure_history: list[tuple[float, int, int]],
     *,
     window: int = TREND_ROLLING_DEPARTURES,
 ) -> list[tuple[float, float, float]]:
-    """(ts, completions/s, scraps/s) at each departure; window = last N departures by count."""
-    if not rate_history or window <= 0:
+    """(ts, completions per second, scraps per second) at every departure point.
+
+    A departure point is a history entry where the cumulative completions or scraps changed.
+    From each one the window reaches back over earlier departure points until it holds at
+    least ``window`` departures. When it reaches the first departure point, it starts at the
+    history entry just before it (or the first entry). Rate = departures in the window /
+    seconds since the window start, rounded to 5 decimals; zero-length windows are left out.
+    """
+    if not departure_history or window <= 0:
         return []
-    dep_indices: list[int] = []
-    for i in range(1, len(rate_history)):
-        ts, nc, ns = rate_history[i]
-        p_nc, p_ns = rate_history[i - 1][1], rate_history[i - 1][2]
-        if int(nc) != int(p_nc) or int(ns) != int(p_ns):
-            dep_indices.append(i)
-    if not dep_indices:
+    departure_points: list[int] = []
+    for i in range(1, len(departure_history)):
+        ts, completions, scraps = departure_history[i]
+        prev_completions, prev_scraps = departure_history[i - 1][1], departure_history[i - 1][2]
+        if int(completions) != int(prev_completions) or int(scraps) != int(prev_scraps):
+            departure_points.append(i)
+    if not departure_points:
         return []
     out: list[tuple[float, float, float]] = []
-    for di in range(len(dep_indices)):
-        idx = dep_indices[di]
-        ts, nc, ns = rate_history[idx]
-        j = di
-        dep_in_window = 0
-        while j > 0 and dep_in_window < window:
-            j -= 1
-            p_idx = dep_indices[j]
-            n_idx = dep_indices[j + 1]
-            dep_in_window += (rate_history[n_idx][1] - rate_history[p_idx][1]) + (
-                rate_history[n_idx][2] - rate_history[p_idx][2]
+    for k in range(len(departure_points)):
+        point = departure_points[k]
+        ts, completions, scraps = departure_history[point]
+        window_start_k = k
+        departures_in_window = 0
+        while window_start_k > 0 and departures_in_window < window:
+            window_start_k -= 1
+            older = departure_points[window_start_k]
+            newer = departure_points[window_start_k + 1]
+            departures_in_window += (departure_history[newer][1] - departure_history[older][1]) + (
+                departure_history[newer][2] - departure_history[older][2]
             )
-        if j == 0:
-            base_idx = dep_indices[0] - 1
-            if base_idx < 0:
-                t0, c0, s0 = rate_history[0]
+        if window_start_k == 0:
+            before_first_departure = departure_points[0] - 1
+            if before_first_departure < 0:
+                start_ts, completions_at_start, scraps_at_start = departure_history[0]
             else:
-                t0, c0, s0 = rate_history[base_idx]
+                start_ts, completions_at_start, scraps_at_start = departure_history[before_first_departure]
         else:
-            t0, c0, s0 = rate_history[dep_indices[j]]
-        dt = float(ts) - float(t0)
-        if dt <= 0:
+            start_ts, completions_at_start, scraps_at_start = departure_history[
+                departure_points[window_start_k]
+            ]
+        window_seconds = float(ts) - float(start_ts)
+        if window_seconds <= 0:
             continue
         out.append(
             (
                 float(ts),
-                round((int(nc) - int(c0)) / dt, 5),
-                round((int(ns) - int(s0)) / dt, 5),
+                round((int(completions) - int(completions_at_start)) / window_seconds, 5),
+                round((int(scraps) - int(scraps_at_start)) / window_seconds, 5),
             )
         )
     return out
@@ -581,32 +608,44 @@ class KpiCalculator:
 
         self._sync_stage_wip_at(ts)
 
-    def _stage_kpis(self, obs_time: float, end_ts: float) -> dict[str, dict[str, Any]]:
-        """Per stage: current / time-averaged WIP, departures, throughput, mean flow time."""
+    def _stage_kpis(self, observation_seconds: float, observation_end_ts: float) -> dict[str, dict[str, Any]]:
+        """Per stage, over the whole observation window:
+
+        - wip_instantaneous: parts in the stage now; wip_average: time-weighted (3 decimals);
+        - num_departures: formal exits only (forced reconciliation exits are not counted);
+        - throughput: departures per second of observation (4 decimals);
+        - avg_flow_time: mean seconds from stage entry to formal exit (1 decimal, 0.0 if none).
+        """
         stages_out: dict[str, dict[str, Any]] = {}
-        for s in range(1, 7):
-            hist = self.stage_wip_hist[s]
-            avg_w = round(_wip_average_confirmed(hist, obs_time, end_ts), 3)
-            dep_n = self.stage_departures[s]
-            ft_list = self.stage_flow_times[s]
-            avg_ft = round(sum(ft_list) / len(ft_list), 1) if ft_list else 0.0
-            thr = round(dep_n / obs_time, 4)
-            stages_out["stage{}".format(s)] = {
-                "wip_instantaneous": self.stage_wip[s],
-                "wip_average": avg_w,
-                "num_departures": dep_n,
-                "throughput": thr,
-                "avg_flow_time": avg_ft,
+        for stage in range(1, 7):
+            avg_wip = round(
+                _time_weighted_average_wip(self.stage_wip_hist[stage], observation_seconds, observation_end_ts), 3
+            )
+            departures = self.stage_departures[stage]
+            # stage_flow_times is a defaultdict: this lookup also creates the empty list for a
+            # stage without samples (kept as is; the snapshot has always done this).
+            flow_times = self.stage_flow_times[stage]
+            avg_flow_time = round(sum(flow_times) / len(flow_times), 1) if flow_times else 0.0
+            throughput_per_sec = round(departures / observation_seconds, 4)
+            stages_out["stage{}".format(stage)] = {
+                "wip_instantaneous": self.stage_wip[stage],
+                "wip_average": avg_wip,
+                "num_departures": departures,
+                "throughput": throughput_per_sec,
+                "avg_flow_time": avg_flow_time,
             }
         return stages_out
 
     def _station_kpis(
-        self, end_ts: float
+        self, observation_end_ts: float
     ) -> tuple[dict[str, float], dict[str, dict[str, float]], dict[str, dict[str, str]]]:
-        """Per station: utilization (P_busy + P_fail), state probabilities, live state.
+        """Per station: utilization, state probabilities and live state.
 
-        The current state's open interval is counted up to ``end_ts``. Stations without
-        any state event report idle = 1.0.
+        Shares are over the time since the station's first state event (not the whole
+        observation window); the current state's open interval counts up to
+        ``observation_end_ts``. utilization = busy + fail share, clamped to 0..1.
+        All shares are rounded to 4 decimals. A station without any state event reports
+        idle = 1.0; so does one whose tracked time is still zero.
         """
         utilization: dict[str, float] = {}
         state_probability: dict[str, dict[str, float]] = {}
@@ -628,73 +667,130 @@ class KpiCalculator:
                 }
                 continue
 
-            st = self._stn_state[sid]
-            acc = dict(self._stn_acc[sid])
-            cur = str(st["state"])
-            tail = max(0.0, end_ts - float(st["start"]))
-            acc[cur] = acc.get(cur, 0.0) + tail
+            station = self._stn_state[sid]
+            seconds_in_state = dict(self._stn_acc[sid])  # copy: the open interval is not stored
+            current_state = str(station["state"])
+            open_interval = max(0.0, observation_end_ts - float(station["start"]))
+            seconds_in_state[current_state] = seconds_in_state.get(current_state, 0.0) + open_interval
 
-            total_st = (
-                acc.get("BUSY", 0.0)
-                + acc.get("FAIL", 0.0)
-                + acc.get("BLOCKED", 0.0)
-                + acc.get("IDLE", 0.0)
+            tracked_seconds = (
+                seconds_in_state.get("BUSY", 0.0)
+                + seconds_in_state.get("FAIL", 0.0)
+                + seconds_in_state.get("BLOCKED", 0.0)
+                + seconds_in_state.get("IDLE", 0.0)
             )
-            if total_st < 1e-9:
-                p_busy = p_fail = p_blocked = 0.0
-                p_idle = 1.0
+            if tracked_seconds < 1e-9:
+                busy_share = fail_share = blocked_share = 0.0
+                idle_share = 1.0
             else:
-                p_busy = acc.get("BUSY", 0.0) / total_st
-                p_fail = acc.get("FAIL", 0.0) / total_st
-                p_blocked = acc.get("BLOCKED", 0.0) / total_st
-                p_idle = acc.get("IDLE", 0.0) / total_st
+                busy_share = seconds_in_state.get("BUSY", 0.0) / tracked_seconds
+                fail_share = seconds_in_state.get("FAIL", 0.0) / tracked_seconds
+                blocked_share = seconds_in_state.get("BLOCKED", 0.0) / tracked_seconds
+                idle_share = seconds_in_state.get("IDLE", 0.0) / tracked_seconds
 
-            utilization[sid] = round(max(0.0, min(1.0, p_busy + p_fail)), 4)
+            utilization[sid] = round(max(0.0, min(1.0, busy_share + fail_share)), 4)
             state_probability[sid] = {
-                "busy": round(p_busy, 4),
-                "fail": round(p_fail, 4),
-                "blocked": round(p_blocked, 4),
-                "idle": round(p_idle, 4),
+                "busy": round(busy_share, 4),
+                "fail": round(fail_share, 4),
+                "blocked": round(blocked_share, 4),
+                "idle": round(idle_share, 4),
             }
             station_live[sid] = {
-                "current_state": cur,
-                "current_part_id": str(st.get("part") or "").strip(),
+                "current_state": current_state,
+                "current_part_id": str(station.get("part") or "").strip(),
                 "queue_hint": "",
             }
         return utilization, state_probability, station_live
 
-    def get_snapshot(self) -> dict[str, Any]:
+    def _observation_end_ts(self) -> float:
+        """End of the observation window that time-based KPIs divide by (Unix seconds).
+
+        replay: the last event's time; the wall clock only while there is no event yet.
+        realtime: now, unless the last event is more than ``_REALTIME_STALE_AFTER_SEC`` old;
+        then the window ends at the last event. So once events stop, rates and averages keep
+        decreasing for 30 s and then jump back to their value at the last event. (Why 30 s,
+        and why this switch, is not documented: to be confirmed.)
+        """
         if self.observation_time_mode == "replay":
-            end_ts = float(self.last_event_ts) if self.last_event_ts is not None else datetime.datetime.now().timestamp()
-        else:
-            now = datetime.datetime.now().timestamp()
-            last = float(self.last_event_ts) if self.last_event_ts is not None else now
-            end_ts = last if (now - last) > 30.0 else now
+            return float(self.last_event_ts) if self.last_event_ts is not None else datetime.datetime.now().timestamp()
+        now = datetime.datetime.now().timestamp()
+        last_event = float(self.last_event_ts) if self.last_event_ts is not None else now
+        return last_event if (now - last_event) > _REALTIME_STALE_AFTER_SEC else now
 
+    def _trend_series(self) -> dict[str, list]:
+        """Chart series, built from the last ``_TREND_HISTORY_POINTS`` history entries.
+
+        The history is cut *before* the rolling windows are computed, so a window never
+        reaches further back than those entries.
+        """
+        recent_departures = self.sys_rate_history[-_TREND_HISTORY_POINTS:]
+        return {
+            # [ts, system WIP after the change]
+            "trend_sys_wip_history": [
+                [float(ts), int(wip)] for ts, wip in self.sys_wip_history[-_TREND_HISTORY_POINTS:]
+            ],
+            # [ts, completion %, scrap %] among the recent departures (see _rolling_departure_shares_pct)
+            "trend_rate_history": [
+                [ts, completion_pct, scrap_pct]
+                for ts, completion_pct, scrap_pct in _rolling_departure_shares_pct(recent_departures)
+            ],
+            # [ts, cumulative completions, cumulative scraps]
+            "trend_departure_history": [
+                [float(ts), int(completions), int(scraps)]
+                for ts, completions, scraps in self.sys_rate_history[-_TREND_HISTORY_POINTS:]
+            ],
+            # [ts, completions/s, scraps/s] at departure points (see _rolling_departure_rates_per_sec)
+            "trend_throughput_rates": [
+                [ts, completions_per_sec, scraps_per_sec]
+                for ts, completions_per_sec, scraps_per_sec in _rolling_departure_rates_per_sec(
+                    self.sys_rate_history[-_TREND_HISTORY_POINTS:]
+                )
+            ],
+            "trend_finished_cycle_times": [
+                round(float(x), 4) for x in self.finished_cycle_times[-_TREND_CYCLE_TIME_SAMPLES:]
+            ],
+        }
+
+    def get_snapshot(self) -> dict[str, Any]:
+        """All KPIs at this moment. Not read-only: it first brings stage WIP up to date.
+
+        Definitions (as implemented):
+        - observation window: first event .. ``_observation_end_ts()`` (at least 0.001 s);
+        - complete_rate / throughput: completions per second of observation (4 decimals);
+        - scrap_rate: scraps / departed parts, a fraction 0..1, not per time (3 decimals);
+        - yield_rate: completions / departed parts (4 decimals);
+        - wip_average: time-weighted system WIP over the window (3 decimals);
+        - avg_cycle_time_fin / _all: mean START -> FINISH (and -> SCRAP) seconds (1 decimal).
+        """
+        # Observation window
+        observation_end_ts = self._observation_end_ts()
         start_ts = self.observation_start_ts
-        obs_time = max(0.001, (end_ts - start_ts) if start_ts is not None else 0.001)
+        observation_seconds = max(0.001, (observation_end_ts - start_ts) if start_ts is not None else 0.001)
 
+        # Stage WIP is re-derived from the open laps at the last event's time
+        # (updates stage_wip / stage_wip_hist when they differ).
         if self.last_event_ts is not None:
             self._sync_stage_wip_at(float(self.last_event_ts))
 
-        avg_sys_wip = round(_wip_average_confirmed(self.sys_wip_history, obs_time, end_ts), 3)
-
+        # System KPIs
+        avg_system_wip = round(
+            _time_weighted_average_wip(self.sys_wip_history, observation_seconds, observation_end_ts), 3
+        )
         departed = self.num_completions + self.num_scraps
-        scrap_rate_kpi = round(self.num_scraps / departed, 3) if departed > 0 else 0.0
-        complete_rate = round(self.num_completions / obs_time, 4)
-
-        avg_ct_fin = (
+        scrap_fraction = round(self.num_scraps / departed, 3) if departed > 0 else 0.0
+        completions_per_sec = round(self.num_completions / observation_seconds, 4)
+        avg_cycle_time_finished = (
             round(sum(self.finished_cycle_times) / len(self.finished_cycle_times), 1)
             if self.finished_cycle_times
             else 0.0
         )
-        all_ct = self.finished_cycle_times + self.scrapped_cycle_times
-        avg_ct_all = round(sum(all_ct) / len(all_ct), 1) if all_ct else 0.0
+        all_cycle_times = self.finished_cycle_times + self.scrapped_cycle_times
+        avg_cycle_time_all = round(sum(all_cycle_times) / len(all_cycle_times), 1) if all_cycle_times else 0.0
 
-        stages_out = self._stage_kpis(obs_time, end_ts)
+        stages_out = self._stage_kpis(observation_seconds, observation_end_ts)
+        utilization, state_probability, station_live = self._station_kpis(observation_end_ts)
 
-        utilization, state_probability, station_live = self._station_kpis(end_ts)
-
+        # Time shown on charts: the last event, else the first event, else now.
         if self.last_event_ts is not None:
             chart_time_unix = float(self.last_event_ts)
         elif self.observation_start_ts is not None:
@@ -709,61 +805,40 @@ class KpiCalculator:
             "num_completions": self.num_completions,
             "num_scraps": self.num_scraps,
             "wip_instantaneous": self.sys_wip,
-            "wip_average": avg_sys_wip,
-            "complete_rate": complete_rate,
-            "scrap_rate": scrap_rate_kpi,
-            "avg_cycle_time_fin": avg_ct_fin,
-            "avg_cycle_time_all": avg_ct_all,
+            "wip_average": avg_system_wip,
+            "complete_rate": completions_per_sec,
+            "scrap_rate": scrap_fraction,
+            "avg_cycle_time_fin": avg_cycle_time_finished,
+            "avg_cycle_time_all": avg_cycle_time_all,
             "duplicate_start_count": self.duplicate_start_count,
         }
 
-        _wip_trend = self.sys_wip_history[-200:]
-        trend_sys_wip_history: list[list[float | int]] = [
-            [float(ts), int(w)] for ts, w in _wip_trend
-        ]
-        trend_rate_history: list[list[float]] = [
-            [ts, comp_pct, scrap_pct]
-            for ts, comp_pct, scrap_pct in _rolling_departure_rates(
-                self.sys_rate_history[-200:]
-            )
-        ]
-        trend_departure_history: list[list[float | int]] = [
-            [float(ts), int(nc), int(ns)]
-            for ts, nc, ns in self.sys_rate_history[-200:]
-        ]
-        trend_throughput_rates: list[list[float]] = [
-            [ts, comp_r, scrap_r]
-            for ts, comp_r, scrap_r in _rolling_departure_throughput_rates(
-                self.sys_rate_history[-200:]
-            )
-        ]
-        _fct_cap = self.finished_cycle_times[-1000:]
-        trend_finished_cycle_times: list[float] = [round(float(x), 4) for x in _fct_cap]
+        trends = self._trend_series()
 
         return {
             "system": system_block,
             "stages": stages_out,
-            "trend_sys_wip_history": trend_sys_wip_history,
-            "trend_rate_history": trend_rate_history,
-            "trend_departure_history": trend_departure_history,
-            "trend_throughput_rates": trend_throughput_rates,
-            "trend_finished_cycle_times": trend_finished_cycle_times,
-            # --- backward-compatible top-level keys (MQTT / tests) ---
-            "throughput": complete_rate,
-            "complete_rate": complete_rate,
+            **trends,
+            # --- backward-compatible top-level keys (MQTT / UI / tests) ---
+            # Several are aliases of the same value: throughput == complete_rate (completions/s);
+            # current_wip == instantaneous_wip == wip_instantaneous; avg_wip == wip_average.
+            # scrap_rate is the scrap fraction (see above); flow_time_count is the number of
+            # finished cycle-time samples, avg_cycle_all_sample_count of finished + scrapped.
+            "throughput": completions_per_sec,
+            "complete_rate": completions_per_sec,
             "finished_count": self.num_completions,
             "scrap_count": self.num_scraps,
-            "scrap_rate": scrap_rate_kpi,
-            "observation_time_sec": round(obs_time, 1),
-            "avg_cycle_time_finished_sec": avg_ct_fin,
-            "avg_cycle_time_all_sec": avg_ct_all,
+            "scrap_rate": scrap_fraction,
+            "observation_time_sec": round(observation_seconds, 1),
+            "avg_cycle_time_finished_sec": avg_cycle_time_finished,
+            "avg_cycle_time_all_sec": avg_cycle_time_all,
             "flow_time_count": len(self.finished_cycle_times),
-            "avg_cycle_all_sample_count": len(all_ct),
+            "avg_cycle_all_sample_count": len(all_cycle_times),
             "current_wip": self.sys_wip,
             "instantaneous_wip": self.sys_wip,
             "wip_instantaneous": self.sys_wip,
-            "avg_wip": avg_sys_wip,
-            "wip_average": avg_sys_wip,
+            "avg_wip": avg_system_wip,
+            "wip_average": avg_system_wip,
             "utilization": utilization,
             "state_probability": state_probability,
             "station_live": station_live,
