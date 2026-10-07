@@ -339,7 +339,7 @@ def render_history_panel(*, key_prefix: str = "hist", disabled: bool = False) ->
 
     _rp = st.session_state.get("replay_proc")
     if _rp is not None and _rp.poll() is not None:
-        ui_replay_panel._clear_replay_child_and_temp_file()
+        ui_replay_panel.stop_replay_and_clear_state()
 
     rec_on = recording.is_recording()
     replay_live = (
@@ -513,7 +513,7 @@ def _render_replay_export_toolbar(
                     disabled=disabled,
                     use_container_width=True,
                 ):
-                    ui_replay_panel._clear_replay_child_and_temp_file()
+                    ui_replay_panel.stop_replay_and_clear_state()
                     st.rerun()
             elif st.button(
                 "Start Replay",
@@ -582,7 +582,7 @@ def _start_session_replay(replay_sid: str, speed: float) -> None:
         st.error("No events in this session.")
         return
 
-    ui_replay_panel._clear_replay_child_and_temp_file()
+    ui_replay_panel.stop_replay_and_clear_state()
     ok_ms, ms_msg = process_control.ensure_main_service_replay()
     if not ok_ms:
         st.error(ms_msg)
@@ -597,7 +597,7 @@ def _start_session_replay(replay_sid: str, speed: float) -> None:
             st.error("Failed to switch local config: {}".format(e))
             return
 
-    ui_replay_panel._reset_replay_downstream_for_new_run()
+    ui_replay_panel.clear_kpi_before_replay()
     try:
         st.session_state.replay_proc = mqtt_backend.run_replay_session_subprocess(
             replay_sid, speed

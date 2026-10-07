@@ -29,6 +29,7 @@ tests = [
             "test_home_ui.py",
             "test_factory_floor_sim.py",
             "test_kpi_display_ui.py",
+            "test_replay_panel.py",
         ],
     ),
     ("Neo4j integration (opt-in: NEO4J_TEST_URI)", ["test_floor_events_neo4j.py"]),

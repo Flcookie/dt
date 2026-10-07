@@ -111,8 +111,8 @@ def env(monkeypatch, tmp_path):
     m(mqtt_backend, "switch_config_file", rec("switch_config"))
     m(mqtt_backend, "run_replay_session_subprocess", rec("spawn", lambda sid, speed: _Proc(4242)))
     m(recording, "is_recording", lambda: cfg["recording"])
-    m(replay_panel, "_clear_replay_child_and_temp_file", _clear_child)
-    m(replay_panel, "_reset_replay_downstream_for_new_run", rec("reset_downstream"))
+    m(replay_panel, "stop_replay_and_clear_state", _clear_child)
+    m(replay_panel, "clear_kpi_before_replay", rec("reset_downstream"))
     # Replace only history_panel's view of `time` (patching time.sleep globally breaks AppTest).
     m(hp, "time", types.SimpleNamespace(sleep=rec("sleep")))
     m(hp, "PROJECT_ROOT", str(tmp_path))

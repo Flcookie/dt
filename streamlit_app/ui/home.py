@@ -503,7 +503,7 @@ display:flex;align-items:center;gap:12px;">
             if ds != "live":
                 try:
                     ui_replay_panel.ensure_replay_session_state()
-                    ui_replay_panel._clear_replay_child_and_temp_file()
+                    ui_replay_panel.stop_replay_and_clear_state()
                     mqtt_backend.clear_kpi_snapshot()
                     _validate_config_basename("config.json")
                     mqtt_backend.switch_config_file("config.json")
@@ -541,7 +541,7 @@ display:flex;align-items:center;gap:12px;">
                 try:
                     if ds == "live":
                         ui_replay_panel.ensure_replay_session_state()
-                        ui_replay_panel._clear_replay_child_and_temp_file()
+                        ui_replay_panel.stop_replay_and_clear_state()
                     mqtt_backend.clear_kpi_snapshot()
                     fn = _local_config_basename()
                     _validate_config_basename(fn)

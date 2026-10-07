@@ -82,7 +82,7 @@ def env(monkeypatch, tmp_path):
     m(physical_workflow, "stop_physical_line_integrated", rec("stop_line", lambda: cfg["stop_line"]))
     m(recording, "is_recording", lambda: cfg["recording"])
     m(recording, "current_path", lambda: cfg["rec_path"])
-    m(replay_panel, "_clear_replay_child_and_temp_file", rec("clear_replay_child"))
+    m(replay_panel, "stop_replay_and_clear_state", rec("clear_replay_child"))
     m(history_panel, "render_history_panel", rec("render_history_panel"))
     # Replace only home's view of `time` (patching time.sleep globally breaks AppTest).
     m(home, "time", types.SimpleNamespace(sleep=rec("sleep")))

@@ -25,8 +25,12 @@ def ensure_replay_session_state() -> None:
         st.session_state.replay_csv_path = None
 
 
-def _clear_replay_child_and_temp_file() -> None:
-    """Kill replay subprocess if alive, remove temp CSV, drop Neo4j progress baseline."""
+def stop_replay_and_clear_state() -> None:
+    """Stop the replay worker if it is still running, then clear what it left in the session:
+    forget the process, delete the uploaded temp CSV and drop the Neo4j progress baseline.
+
+    Also used after a replay has finished on its own (only the clean-up part applies then).
+    """
     p = st.session_state.get("replay_proc")
     if p is not None:
         if p.poll() is None:
@@ -46,8 +50,9 @@ def _clear_replay_child_and_temp_file() -> None:
             pass
 
 
-def _reset_replay_downstream_for_new_run() -> None:
-    """Clear cached KPI before a replay worker starts (CSV replay may open a new Neo4j session)."""
+def clear_kpi_before_replay() -> None:
+    """Clear the KPI snapshot and the page's cached KPI before a replay worker starts, so the
+    dashboard does not show the previous run (CSV replay may open a new Neo4j session)."""
     mqtt_backend.clear_kpi_snapshot()
     for _k in ("_kpi_cache", "_kpi_tupd"):
         st.session_state.pop(_k, None)
@@ -70,7 +75,7 @@ def render_csv_replay_block(*, key_prefix: str) -> None:
     with st.container(border=False):
         p = st.session_state.replay_proc
         if p is not None and p.poll() is not None:
-            _clear_replay_child_and_temp_file()
+            stop_replay_and_clear_state()
             st.success("Replay finished.")
             if process_control.is_main_service_running():
                 _n, _msg = process_control.stop_main_service()
@@ -140,7 +145,7 @@ def render_csv_replay_block(*, key_prefix: str) -> None:
                     st.error("Upload a CSV first.")
                 else:
                     # Always stop an existing replay worker so «Start» is idempotent (restart from CSV top).
-                    _clear_replay_child_and_temp_file()
+                    stop_replay_and_clear_state()
 
                     _ok_ms, _ms_msg = process_control.ensure_main_service_replay()
                     if not _ok_ms:
@@ -165,7 +170,7 @@ def render_csv_replay_block(*, key_prefix: str) -> None:
                         )
 
                     if not _abort_replay:
-                        _reset_replay_downstream_for_new_run()
+                        clear_kpi_before_replay()
                         path = os.path.join(
                             tempfile.gettempdir(),
                             "lego_replay_{}.csv".format(int(time.time())),
@@ -200,7 +205,7 @@ def render_csv_replay_block(*, key_prefix: str) -> None:
                 key="{}_replay_kill".format(key_prefix),
                 type="primary",
             ):
-                _clear_replay_child_and_temp_file()
+                stop_replay_and_clear_state()
                 _n, _msg = process_control.stop_main_service()
                 st.success("{}".format(_msg))
                 st.rerun()
